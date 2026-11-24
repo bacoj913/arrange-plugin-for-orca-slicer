@@ -329,10 +329,202 @@ class SpeedTest(Base):
         self.assertLess(elapsed, 20.0)
 
 
+class AlignTest(Base):
+    def test_hull(self):
+        pts = [(0, 0), (2, 0), (2, 2), (0, 2), (1, 1), (1, 0)]
+        self.assertEqual(sorted(abh.convex_hull(pts)), [(0, 0), (0, 2), (2, 0), (2, 2)])
+
+    def test_angle(self):
+        along_x = [(0, 0), (40, 0), (40, 10), (0, 10)]
+        self.assertAlmostEqual(abs(abh.y_align_angle(along_x)), math.pi / 2)
+        along_y = [(0, 0), (10, 0), (10, 40), (0, 40)]
+        self.assertEqual(abh.y_align_angle(along_y), 0.0)
+        square = [(0, 0), (20, 0), (20, 20), (0, 20)]
+        self.assertEqual(abh.y_align_angle(square), 0.0)
+        near_square = [(0, 0), (22, 0), (22, 20), (0, 20)]
+        self.assertEqual(abh.y_align_angle(near_square), 0.0)
+        c, s = math.cos(math.radians(30)), math.sin(math.radians(30))
+        tilted = [(x * c - y * s, x * s + y * c) for x, y in along_x]
+        turned = abh.rotate_points(tilted, abh.y_align_angle(tilted), (0, 0))
+        xs, ys = zip(*turned)
+        self.assertAlmostEqual(max(xs) - min(xs), 10, places=6)
+        self.assertAlmostEqual(max(ys) - min(ys), 40, places=6)
+
+    def test_rotate_z_keeps_pivot(self):
+        m = abh.parse_transform(translate(5, 6, 1))
+        r = abh.rotate_z(m, math.pi / 2, (5, 6))
+        self.assertEqual([round(v, 9) for v in abh.apply_transform(r, (0, 0, 0))], [5, 6, 1])
+        self.assertEqual([round(v, 9) for v in abh.apply_transform(r, (1, 0, 0))], [5, 7, 1])
+
+    def long_parts(self):
+        return [(60, 12, 5 + i, [translate(40, 20 + 20 * i)]) for i in range(4)]
+
+    def test_auto_on_for_bedslinger(self):
+        summary, project, _ = self.run_arrange(self.long_parts(),
+                                               config={"printer_structure": "i3"})
+        self.assertTrue(summary["aligned"])
+        self.assertEqual(summary["rotated"], 4)
+        for it in project.items:
+            self.assertAlmostEqual(it.width, 12, places=6)
+            self.assertAlmostEqual(it.depth, 60, places=6)
+        self.assert_valid(project, abh.MIN_AUTO_GAP)
+
+    def test_auto_off_for_corexy(self):
+        summary, project, _ = self.run_arrange(self.long_parts(),
+                                               config={"printer_structure": "corexy"})
+        self.assertFalse(summary["aligned"])
+        for it in project.items:
+            self.assertAlmostEqual(it.width, 60, places=6)
+
+    def test_forced_on_and_off(self):
+        summary, project, _ = self.run_arrange(self.long_parts(), {"align_y": "on"})
+        self.assertEqual(summary["rotated"], 4)
+        summary, project, _ = self.run_arrange(self.long_parts(), {"align_y": "off"},
+                                               config={"printer_structure": "i3"})
+        self.assertEqual(summary["rotated"], 0)
+
+    def test_already_aligned_not_turned(self):
+        objects = [(12, 60, 5, [translate(40, 40)]), (60, 12, 5, [rot_z90(100, 100)])]
+        summary, project, _ = self.run_arrange(objects, {"align_y": "on"})
+        self.assertEqual(summary["rotated"], 0)
+
+    def test_summary_layout(self):
+        summary, _, _ = self.run_arrange(self.long_parts(), {"align_y": "on"})
+        self.assertEqual(summary["bed"], [0, 0, 200, 200])
+        names = sorted(o["name"] for o in summary["layout"][0])
+        self.assertEqual(names, ["Part 1", "Part 2", "Part 3", "Part 4"])
+
+
+class FakeOrca:
+    """The parts of OrcaSlicer's embedded `orca` module the plugin uses."""
+
+    def __init__(self, tmp, project_path, export_source):
+        import types
+        self.module = types.ModuleType("orca")
+        test = self
+
+        class Base:
+            def __init__(self):
+                self.config = "{}"
+                self.sent = []
+
+            def get_config(self):
+                return self.config
+
+            def save_config(self, text):
+                self.config = text
+                return True
+
+            def post_message(self, data):
+                self.sent.append(data)
+
+        class BBox:
+            def __init__(self, b):
+                self.min, self.max = b[:3], b[3:]
+
+        class Inst:
+            def __init__(self, b):
+                self.b = b
+
+            def bounding_box(self):
+                return BBox(self.b)
+
+        class Obj:
+            def __init__(self, boxes):
+                self.boxes = boxes
+
+            def instances(self):
+                return [Inst(b) for b in self.boxes]
+
+        class Model:
+            def objects(self):
+                return [Obj(b) for b in test.boxes]
+
+            def object_count(self):
+                return len(test.boxes)
+
+        class Plater:
+            def project_path(self):
+                return project_path
+
+            def export_3mf_copy(self, path):
+                import shutil
+                shutil.copy(export_source, path)
+
+        class Bundle:
+            def full_config_value(self, key):
+                return "i3" if key == "printer_structure" else None
+
+        host = types.SimpleNamespace(
+            model=Model, plater=Plater, preset_bundle=Bundle,
+            plugin=types.SimpleNamespace(storage=lambda: tmp))
+        m = self.module
+        m.host = host
+        m.pages = types.SimpleNamespace(PagesPluginCapabilityBase=Base)
+        m.base = object
+        m.plugin = lambda cls: cls
+        m.registered = []
+        m.register_capability = m.registered.append
+        m.LifecycleEvent = types.SimpleNamespace(ProjectOpened=1, NewProject=2,
+                                                 ProjectAfterSave=3, PresetSelected=4)
+        self.boxes = []
+
+
+class PluginTest(Base):
+    def load_plugin(self, fake):
+        import importlib.util
+        sys.modules["orca"] = fake.module
+        try:
+            spec = importlib.util.spec_from_file_location(
+                "abh_plugin", os.path.join(os.path.dirname(__file__), "..",
+                                           "arrange_by_height", "arrange_by_height.py"))
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+        finally:
+            del sys.modules["orca"]
+        return mod
+
+    def test_page_flow(self):
+        make_project(self.src, [(20, 20, 10, [translate(50, 50)]),
+                                (20, 20, 30, [translate(100, 50)])])
+        project_path = os.path.join(self.tmp.name, "brackets.3mf")
+        fake = FakeOrca(self.tmp.name, project_path, self.src)
+        fake.boxes = [[(40, 40, 0, 60, 60, 10)], [(90, 40, 0, 110, 60, 30)]]
+        mod = self.load_plugin(fake)
+        mod.ArrangeByHeightPlugin().register_capabilities()
+        self.assertEqual(fake.module.registered, [mod.ArrangeByHeightPage])
+        page = mod.ArrangeByHeightPage()
+        self.assertIn("Arrange by Height", page.get_ui())
+        self.assertTrue(page.get_icon().endswith(".svg"))
+
+        page.on_message(json.dumps({"type": "ready"}))
+        state = page.sent[-1]
+        self.assertEqual(state["type"], "state")
+        self.assertEqual(state["out"], os.path.join(self.tmp.name, "brackets-arranged.3mf"))
+        self.assertTrue(state["bedslinger"])
+
+        page.on_message({"type": "arrange", "out": state["out"],
+                         "settings": {"spacing": "5", "layout": "grid", "plates": "keep",
+                                      "align_y": "off"}})
+        result = page.sent[-1]
+        self.assertTrue(result["ok"], result["text"])
+        self.assertEqual(result["summary"]["objects"], 2)
+        self.assertTrue(os.path.exists(state["out"]))
+        self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "export.3mf")))
+        self.assertEqual(json.loads(page.config)["layout"], "grid")
+
+        page.on_message({"type": "arrange", "out": "bad.txt", "settings": {}})
+        self.assertFalse(page.sent[-1]["ok"])
+        page.on_message({"type": "arrange", "out": state["out"],
+                         "settings": {"spacing": "wide"}})
+        self.assertIn("Spacing", page.sent[-1]["text"])
+
+
 class CommandLineTest(Base):
     def test_main(self):
         make_project(self.src, [(20, 20, 10, [translate(50, 50)])])
-        self.assertEqual(abh.main([self.src, "-o", self.out, "--spacing", "3"]), 0)
+        self.assertEqual(abh.main([self.src, "-o", self.out, "--spacing", "3",
+                                   "--align-y", "on"]), 0)
         self.assertTrue(os.path.exists(self.out))
 
 

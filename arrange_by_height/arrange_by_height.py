@@ -21,10 +21,12 @@ Layout rules:
   "By object", OrcaSlicer prints in object list order, so tall objects print last.
 - Spacing is a fixed value in mm, or Auto: OrcaSlicer's own arrange spacing for the plate's
   print sequence.
+- Align to Y axis turns each long object so its long side runs along Y, as OrcaSlicer's
+  arrange does for bedslinger printers. Auto turns it on when the printer structure is i3.
 
 Command line (no OrcaSlicer needed):
     python arrange_by_height.py project.3mf [-o out.3mf] [--spacing auto|MM]
-        [--layout compact|grid] [--plates keep|regroup]
+        [--layout compact|grid] [--plates keep|regroup] [--align-y auto|on|off]
 """
 
 import argparse
@@ -38,7 +40,7 @@ import xml.etree.ElementTree as ET
 
 try:
     import orca  # OrcaSlicer's embedded module; only present inside OrcaSlicer.
-    if not hasattr(orca, "script") or not hasattr(orca, "plugin"):
+    if not hasattr(orca, "pages") or not hasattr(orca, "plugin"):
         orca = None  # An unrelated package named "orca".
 except ImportError:
     orca = None
@@ -55,9 +57,11 @@ DEFAULT_SETTINGS = {
     "spacing": "auto",       # "auto" or a number in mm
     "layout": "compact",     # "compact" or "grid"
     "plates": "keep",        # "keep" or "regroup"
+    "align_y": "auto",       # "auto", "on" or "off"
 }
 MIN_AUTO_GAP = 2.0           # mm, used for "By layer" when there is no brim
 ROW_BAND = 20.0              # mm, row height used to order objects of equal height
+ALIGN_MAX_RATIO = 0.66       # OrcaSlicer leaves an object as is above this axis ratio
 EPS = 1e-6
 
 # Plate metadata that is no longer valid once objects move.
@@ -88,6 +92,7 @@ class Item:
         self.y = None
         self.transform = None                 # 3MF item transform, 3x4 rows
         self.identify_id = None
+        self.rotated = 0.0                    # radians turned about Z by Align to Y axis
         self.old_origin = (0.0, 0.0)          # world origin of the plate the item was on
 
     @property
@@ -184,6 +189,95 @@ def _point_in_polygon(pt, poly):
     return inside
 
 
+def convex_hull(points):
+    """Convex hull of 2D points, counter-clockwise (monotone chain)."""
+    pts = sorted(set(points))
+    if len(pts) <= 2:
+        return pts
+
+    def cross(o, a, b):
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    lower, upper = [], []
+    for p in pts:
+        while len(lower) >= 2 and cross(lower[-2], lower[-1], p) <= 0:
+            lower.pop()
+        lower.append(p)
+    for p in reversed(pts):
+        while len(upper) >= 2 and cross(upper[-2], upper[-1], p) <= 0:
+            upper.pop()
+        upper.append(p)
+    return lower[:-1] + upper[:-1]
+
+
+def y_align_angle(hull):
+    """Rotation (radians, counter-clockwise) that turns the outline's long axis onto Y.
+
+    Same rule as OrcaSlicer (update_selected_items_axis_align in Arrange.cpp): the long
+    axis comes from the outline's second moments of area, and an outline whose two axes
+    are close in size (ratio above 0.66) is not turned. Returns 0 for no rotation.
+    """
+    n = len(hull)
+    if n < 3:
+        return 0.0
+    a = cx = cy = sxx = syy = sxy = 0.0
+    for i in range(n):
+        x0, y0 = hull[i - 1]
+        x1, y1 = hull[i]
+        d = x0 * y1 - x1 * y0
+        a += d
+        cx += (x0 + x1) * d
+        cy += (y0 + y1) * d
+        sxx += (x0 * x0 + x0 * x1 + x1 * x1) * d
+        syy += (y0 * y0 + y0 * y1 + y1 * y1) * d
+        sxy += (x0 * y1 + 2 * x0 * y0 + 2 * x1 * y1 + x1 * y0) * d
+    if abs(a) < EPS:
+        return 0.0
+    area = a / 2.0
+    cx /= 6.0 * area
+    cy /= 6.0 * area
+    mxx = sxx / 12.0 / area - cx * cx      # variance along X
+    myy = syy / 12.0 / area - cy * cy      # variance along Y
+    mxy = sxy / 24.0 / area - cx * cy
+    big, small = max(abs(mxx), abs(myy)), min(abs(mxx), abs(myy))
+    if big < EPS or small / big > ALIGN_MAX_RATIO:
+        return 0.0
+    angle = math.pi / 2.0 - math.atan2(2.0 * mxy, mxx - myy) / 2.0
+    # Fold to (-pi/2, pi/2]: turning by pi gives the same footprint.
+    while angle > math.pi / 2.0 + EPS:
+        angle -= math.pi
+    while angle <= -math.pi / 2.0 + EPS:
+        angle += math.pi
+    return 0.0 if abs(angle) < 1e-3 else angle
+
+
+def rotate_z(transform, angle, pivot):
+    """Turn a 3MF transform by `angle` about the vertical line through `pivot` (x, y)."""
+    c, s = math.cos(angle), math.sin(angle)
+    m = [row[:] for row in transform]
+    for r in range(4):
+        x, y = m[r][0], m[r][1]
+        if r == 3:
+            x -= pivot[0]
+            y -= pivot[1]
+        m[r][0] = x * c - y * s
+        m[r][1] = x * s + y * c
+        if r == 3:
+            m[r][0] += pivot[0]
+            m[r][1] += pivot[1]
+    return m
+
+
+def rotate_points(points, angle, pivot):
+    c, s = math.cos(angle), math.sin(angle)
+    out = []
+    for x, y in points:
+        x -= pivot[0]
+        y -= pivot[1]
+        out.append((x * c - y * s + pivot[0], x * s + y * c + pivot[1]))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # Settings
 # ---------------------------------------------------------------------------
@@ -243,6 +337,16 @@ def auto_gap(config, print_sequence, items):
     if _str(config.get("brim_type"), "auto_brim") != "no_brim":
         brim = _num(config.get("brim_width")) + _num(config.get("brim_object_gap"))
     return max(2.0 * brim, MIN_AUTO_GAP)
+
+
+def align_enabled(settings, config):
+    """Whether to align objects to Y: "on", "off", or "auto" for bedslinger printers."""
+    value = settings.get("align_y", "auto")
+    if value in (True, "on"):
+        return True
+    if value in (False, "off"):
+        return False
+    return _str(config.get("printer_structure")) == "i3"
 
 
 def edge_margin(config):
@@ -641,26 +745,46 @@ class MeshLibrary:
                     current = None
                     el.clear()
 
-    def bbox(self, path, object_id, transform, depth=0):
+    def points(self, path, object_id, transform, depth=0):
+        """Every vertex of the object, in world coordinates."""
         if depth > 10:
             raise ArrangeError("The 3MF file has circular components.")
         self._load(path)
         obj = self.objects.get((path, object_id))
         if obj is None:
             raise ArrangeError("Object %s is missing from %s." % (object_id, path))
-        box = None
-        if obj["vertices"]:
-            xs, ys, zs = [], [], []
-            for v in obj["vertices"]:
-                x, y, z = apply_transform(transform, v)
-                xs.append(x)
-                ys.append(y)
-                zs.append(z)
-            box = (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+        out = [apply_transform(transform, v) for v in obj["vertices"] or ()]
         for cid, cpath, ctrans in obj["components"]:
-            sub = self.bbox(cpath, cid, compose(ctrans, transform), depth + 1)
-            box = sub if box is None else _merge(box, sub)
-        return box
+            out.extend(self.points(cpath, cid, compose(ctrans, transform), depth + 1))
+        return out
+
+    def bbox(self, path, object_id, transform):
+        pts = self.points(path, object_id, transform)
+        if not pts:
+            return None
+        xs, ys, zs = zip(*pts)
+        return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
+
+    def footprint(self, path, object_id, transform):
+        """Convex outline (x, y) seen from above, and the z range, in world coordinates."""
+        # Instances that differ only by position share one outline.
+        linear = tuple(tuple(round(v, 9) for v in row) for row in transform[:3])
+        key = (path, object_id, linear)
+        cache = self.__dict__.setdefault("_footprints", {})
+        if key not in cache:
+            local = [row[:] for row in transform[:3]] + [[0.0, 0.0, 0.0]]
+            pts = self.points(path, object_id, local)
+            if not pts:
+                cache[key] = None
+            else:
+                cache[key] = (convex_hull([(p[0], p[1]) for p in pts]),
+                              min(p[2] for p in pts), max(p[2] for p in pts))
+        base = cache[key]
+        if base is None:
+            return None
+        hull, z0, z1 = base
+        tx, ty, tz = transform[3]
+        return [(x + tx, y + ty) for x, y in hull], z0 + tz, z1 + tz
 
 
 def _merge(a, b):
@@ -697,6 +821,18 @@ def read_plates(settings_xml):
     return mapping, max(len(plates), 1), sequences
 
 
+def read_object_names(settings_xml):
+    """{object_id: name} from model_settings.config."""
+    names = {}
+    if not settings_xml:
+        return names
+    for obj in ET.fromstring(settings_xml).findall("object"):
+        for m in obj.findall("metadata"):
+            if m.get("key") == "name":
+                names[obj.get("id")] = m.get("value") or ""
+    return names
+
+
 class Project:
     """A 3MF project opened for arranging."""
 
@@ -714,6 +850,7 @@ class Project:
         self.build = read_build_items(self.model_xml)
         self.bed = bed_from_config(self.config)
         mapping, self.plate_count, self.plate_sequences = read_plates(self.settings_xml)
+        self.names = read_object_names(self.settings_xml)
         self.items = []
         counts = {}
         for index, (object_id, _path, transform) in enumerate(self.build):
@@ -724,9 +861,14 @@ class Project:
             it.plate, it.identify_id = mapping.get((object_id, inst), (-1, None))
             self.items.append(it)
 
-    def load_bboxes(self, bboxes=None):
-        """Set each item's world bounding box, from `bboxes` or from the meshes."""
-        if bboxes is not None:
+    def load_bboxes(self, bboxes=None, align_y=False):
+        """Set each item's world bounding box, from `bboxes` or from the meshes.
+
+        With `align_y`, long objects are first turned so their long side runs along Y.
+        """
+        if align_y:
+            self._align_y()
+        elif bboxes is not None:
             if len(bboxes) != len(self.items):
                 raise ArrangeError("Object count does not match the exported project.")
             for it, box in zip(self.items, bboxes):
@@ -738,6 +880,27 @@ class Project:
                     it.bbox = lib.bbox(path or "/" + MODEL_PATH, object_id, it.transform)
                     if it.bbox is None:
                         raise ArrangeError("Object %s has no geometry." % object_id)
+        self._to_plate_coordinates()
+
+    def _align_y(self):
+        with zipfile.ZipFile(self.path) as zf:
+            lib = MeshLibrary(zf)
+            for it, (object_id, path, _t) in zip(self.items, self.build):
+                fp = lib.footprint(path or "/" + MODEL_PATH, object_id, it.transform)
+                if fp is None:
+                    raise ArrangeError("Object %s has no geometry." % object_id)
+                hull, z0, z1 = fp
+                xs, ys = zip(*hull)
+                pivot = ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
+                angle = y_align_angle(hull)
+                if angle:
+                    it.transform = rotate_z(it.transform, angle, pivot)
+                    it.rotated = angle
+                    hull = rotate_points(hull, angle, pivot)
+                    xs, ys = zip(*hull)
+                it.bbox = (min(xs), min(ys), z0, max(xs), max(ys), z1)
+
+    def _to_plate_coordinates(self):
         cols = plate_columns(self.plate_count)
         for it in self.items:
             if it.plate < 0:
@@ -848,13 +1011,24 @@ def _instance_xml(it):
 def arrange_file(in_path, out_path, settings, bboxes=None):
     """Arrange `in_path` and write `out_path`. Returns a short summary."""
     project = Project(in_path)
-    project.load_bboxes(bboxes)
+    align = align_enabled(settings, project.config)
+    project.load_bboxes(bboxes, align_y=align)
     project.arrange(settings)
     project.write(out_path)
+    bed = project.bed
     return {
         "objects": len(project.items),
         "plates": project.new_plate_count,
         "plates_before": project.plate_count,
+        "aligned": align,
+        "rotated": sum(1 for it in project.items if it.rotated),
+        "bed": [bed.x0, bed.y0, bed.x1, bed.y1],
+        "layout": [
+            [{"name": project.names.get(it.object_id) or "Object %s" % it.object_id,
+              "x": round(it.x, 2), "y": round(it.y, 2),
+              "w": round(it.width, 2), "d": round(it.depth, 2), "h": round(it.height, 2)}
+             for it in project.items if it.plate == p]
+            for p in range(project.new_plate_count)],
     }
 
 
@@ -862,19 +1036,37 @@ def arrange_file(in_path, out_path, settings, bboxes=None):
 # OrcaSlicer plugin
 # ---------------------------------------------------------------------------
 
-DIALOG_HTML = """<!doctype html>
+PAGE_HTML = """<!doctype html>
 <html><head><meta charset="utf-8"><style>
-body { font-family: var(--orca-font, sans-serif); margin: 16px; }
+body { font-family: var(--orca-font, sans-serif); margin: 0; }
+.wrap { display: flex; gap: 20px; padding: 16px; align-items: flex-start; }
+.side { width: 320px; flex: none; }
+.main { flex: 1; min-width: 0; }
 h2 { margin: 0 0 12px; font-size: 16px; }
+h3 { margin: 0 0 8px; font-size: 14px; }
 fieldset { border: 1px solid var(--orca-border, #ccc); margin: 0 0 12px; padding: 8px 12px; }
 legend { font-weight: 600; }
 label { display: block; margin: 4px 0; }
-.note { color: var(--orca-muted, #666); font-size: 12px; margin: 2px 0 0 22px; }
+.note { color: var(--orca-muted, #666); font-size: 12px; margin: 2px 0 4px 22px; }
+.note.flat { margin-left: 0; }
 input[type=number] { width: 70px; }
 input[type=text] { width: 100%; box-sizing: border-box; }
-.buttons { text-align: right; margin-top: 12px; }
-.buttons button { margin-left: 8px; min-width: 80px; }
+select { min-width: 90px; }
+#arrange { width: 100%; padding: 6px; font-weight: 600; }
+#status { margin: 0 0 12px; min-height: 1.2em; white-space: pre-wrap; }
+#status.error { color: #d9534f; }
+.plates { display: flex; flex-wrap: wrap; gap: 16px; }
+.plate { width: 340px; }
+.plate svg { width: 340px; height: 340px; display: block; }
+.plate .bed { fill: none; stroke: var(--orca-border, #999); }
+.plate rect.obj { stroke: rgba(0, 0, 0, 0.6); stroke-width: 0.6; }
+.plate text { font-size: 7px; fill: #111; text-anchor: middle; dominant-baseline: middle; }
+.legend { display: flex; align-items: center; gap: 8px; font-size: 12px; margin: 0 0 12px; }
+.legend .bar { width: 140px; height: 10px;
+  background: linear-gradient(90deg, hsl(210,70%,60%), hsl(110,70%,52%), hsl(20,70%,45%)); }
 </style></head><body>
+<div class="wrap">
+<div class="side">
 <h2>Arrange by Height</h2>
 <fieldset><legend>Spacing</legend>
   <label><input type="radio" name="spacing" value="auto"> Auto</label>
@@ -894,41 +1086,141 @@ input[type=text] { width: 100%; box-sizing: border-box; }
   <label><input type="radio" name="plates" value="regroup"> Regroup plates by height</label>
   <div class="note">Tallest objects on plate 1. Objects of similar height share a plate.</div>
 </fieldset>
+<fieldset><legend>Align to Y Axis</legend>
+  <select id="align"><option value="auto">Auto</option><option value="on">On</option>
+    <option value="off">Off</option></select>
+  <div class="note flat">Turns long objects so their long side runs along Y.
+    Auto: on for bedslinger printers (printer structure i3).
+    <span id="printer"></span></div>
+</fieldset>
 <fieldset><legend>Output File</legend>
   <input type="text" id="out">
+  <div class="note flat">Open it with File &gt; Open Project after arranging.</div>
 </fieldset>
-<div class="buttons">
-  <button id="cancel">Cancel</button><button id="ok">Arrange</button>
+<button id="arrange">Arrange</button>
+</div>
+<div class="main">
+  <h3>Result</h3>
+  <div id="status">Set the options and click Arrange.</div>
+  <div class="legend" id="legend" hidden><span>Short</span><span class="bar"></span>
+    <span>Tall</span></div>
+  <div class="plates" id="plates"></div>
+</div>
 </div>
 <script>
-const init = __INIT__;
+let outEdited = false;
 function pick(name, value) {
   document.querySelectorAll('input[name=' + name + ']').forEach(function (el) {
     el.checked = el.value === value;
   });
 }
-pick('spacing', init.spacing === 'auto' ? 'auto' : 'manual');
-document.getElementById('gap').value = init.spacing === 'auto' ? init.manual_gap : init.spacing;
-pick('layout', init.layout);
-pick('plates', init.plates);
-document.getElementById('out').value = init.out;
 function value(name) {
   const el = document.querySelector('input[name=' + name + ']:checked');
   return el ? el.value : null;
 }
-document.getElementById('ok').onclick = function () {
+function setStatus(text, error) {
+  const el = document.getElementById('status');
+  el.textContent = text;
+  el.className = error ? 'error' : '';
+}
+function applyState(st) {
+  const s = st.settings || {};
+  if (s.spacing) {
+    pick('spacing', s.spacing === 'auto' ? 'auto' : 'manual');
+    document.getElementById('gap').value = s.spacing === 'auto' ? s.manual_gap : s.spacing;
+  }
+  if (s.layout) pick('layout', s.layout);
+  if (s.plates) pick('plates', s.plates);
+  if (s.align_y) document.getElementById('align').value = s.align_y;
+  if (st.out && !outEdited) document.getElementById('out').value = st.out;
+  if (st.printer !== undefined) {
+    document.getElementById('printer').textContent = st.printer
+      ? 'Current printer: ' + (st.bedslinger ? 'bedslinger (Auto is on).'
+                                             : 'not a bedslinger (Auto is off).')
+      : '';
+  }
+}
+function color(f) {
+  const hue = f < 0.5 ? 210 - 200 * f : 110 - 180 * (f - 0.5);
+  return 'hsl(' + Math.round(hue) + ',70%,' + Math.round(60 - 15 * f) + '%)';
+}
+function esc(t) {
+  return String(t).replace(/[&<>"]/g, function (c) {
+    return {'&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;'}[c];
+  });
+}
+function drawPlates(sum) {
+  const box = document.getElementById('plates');
+  box.innerHTML = '';
+  if (!sum || !sum.layout) return;
+  const b = sum.bed, w = b[2] - b[0], d = b[3] - b[1];
+  let hmax = 0;
+  sum.layout.forEach(function (pl) { pl.forEach(function (o) { hmax = Math.max(hmax, o.h); }); });
+  sum.layout.forEach(function (pl, i) {
+    let svg = '<svg viewBox="' + (b[0] - 2) + ' ' + (-b[3] - 2) + ' ' + (w + 4) + ' ' +
+      (d + 4) + '">';
+    svg += '<rect class="bed" x="' + b[0] + '" y="' + (-b[3]) + '" width="' + w +
+      '" height="' + d + '"/>';
+    pl.forEach(function (o) {
+      const f = hmax > 0 ? o.h / hmax : 0;
+      svg += '<g><title>' + esc(o.name) + ': ' + o.w + ' x ' + o.d + ' x ' + o.h + ' mm</title>' +
+        '<rect class="obj" x="' + o.x + '" y="' + (-(o.y + o.d)) + '" width="' + o.w +
+        '" height="' + o.d + '" fill="' + color(f) + '"/>';
+      if (o.w >= 8 && o.d >= 6) {
+        svg += '<text x="' + (o.x + o.w / 2) + '" y="' + (-(o.y + o.d / 2)) + '">' +
+          Math.round(o.h) + '</text>';
+      }
+      svg += '</g>';
+    });
+    svg += '</svg>';
+    const div = document.createElement('div');
+    div.className = 'plate';
+    div.innerHTML = '<h3>Plate ' + (i + 1) + ' (' + pl.length + ')</h3>' + svg;
+    box.appendChild(div);
+  });
+  document.getElementById('legend').hidden = false;
+}
+function settings() {
   const manual = value('spacing') === 'manual';
-  orca.submit({
-    ok: true,
+  return {
     spacing: manual ? document.getElementById('gap').value : 'auto',
     manual_gap: document.getElementById('gap').value,
     layout: value('layout'),
     plates: value('plates'),
-    out: document.getElementById('out').value
-  });
+    align_y: document.getElementById('align').value
+  };
+}
+document.getElementById('out').addEventListener('input', function () { outEdited = true; });
+document.getElementById('arrange').onclick = function () {
+  setStatus('Arranging...');
+  document.getElementById('arrange').disabled = true;
+  // Let the page repaint before the plugin starts working.
+  setTimeout(function () {
+    orca.postMessage({type: 'arrange', settings: settings(),
+                      out: document.getElementById('out').value});
+  }, 50);
 };
-document.getElementById('cancel').onclick = function () { orca.submit({ ok: false }); };
+orca.onMessage(function (msg) {
+  if (typeof msg === 'string') msg = JSON.parse(msg);
+  if (msg.type === 'state') {
+    applyState(msg);
+  } else if (msg.type === 'result') {
+    document.getElementById('arrange').disabled = false;
+    setStatus(msg.text, !msg.ok);
+    if (msg.ok) drawPlates(msg.summary);
+  }
+});
+pick('spacing', 'auto');
+pick('layout', 'compact');
+pick('plates', 'keep');
+orca.postMessage({type: 'ready'});
 </script></body></html>
+"""
+
+ICON_SVG = """<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none"
+ stroke="#009688" stroke-width="2" stroke-linejoin="round">
+<rect x="9.5" y="3" width="5" height="18"/><rect x="3" y="11" width="4.5" height="10"/>
+<rect x="16.5" y="11" width="4.5" height="10"/></svg>
 """
 
 
@@ -950,16 +1242,85 @@ def _live_bboxes():
     return boxes
 
 
+def _clean_settings(raw, saved):
+    """Settings from the page, checked. Raises ArrangeError for a bad value."""
+    raw = raw or {}
+    spacing = raw.get("spacing", "auto")
+    if spacing != "auto":
+        try:
+            spacing = str(max(float(spacing), 0.0))
+        except (TypeError, ValueError):
+            raise ArrangeError("Spacing must be a number in mm.")
+    return {
+        "spacing": spacing,
+        "manual_gap": str(raw.get("manual_gap") or saved.get("manual_gap") or "6"),
+        "layout": raw.get("layout") if raw.get("layout") in ("compact", "grid") else "compact",
+        "plates": raw.get("plates") if raw.get("plates") in ("keep", "regroup") else "keep",
+        "align_y": raw.get("align_y") if raw.get("align_y") in ("auto", "on", "off") else "auto",
+    }
+
+
+def _count(n, word):
+    return "%d %s%s" % (n, word, "" if n == 1 else "s")
+
+
+def run_live(raw_settings, out_path, saved):
+    """Arrange the open project. Returns (ok, text, summary, settings)."""
+    try:
+        settings = _clean_settings(raw_settings, saved)
+        out_path = (out_path or "").strip()
+        if not out_path.lower().endswith(".3mf"):
+            raise ArrangeError("The output file must end in .3mf.")
+        plater = orca.host.plater()
+        if orca.host.model().object_count() == 0:
+            raise ArrangeError("The project has no objects.")
+        storage = orca.host.plugin.storage()
+        export_path = os.path.join(storage, "export.3mf")
+        try:
+            plater.export_3mf_copy(export_path)
+            # Sizes from the live model are exact and fast; the exported build lists the
+            # instances in the same order. Align to Y axis reads the meshes instead.
+            summary = arrange_file(export_path, out_path, settings, _live_bboxes())
+        finally:
+            try:
+                os.remove(export_path)
+            except OSError:
+                pass
+    except Exception as err:  # Shown to the user; the plugin must not crash OrcaSlicer.
+        return False, str(err) or err.__class__.__name__, None, None
+    text = "Arranged %s on %s." % (_count(summary["objects"], "object"),
+                                   _count(summary["plates"], "plate"))
+    if summary["aligned"]:
+        text += " Turned %s to the Y axis." % _count(summary["rotated"], "object")
+    text += "\nSaved to %s\nOpen it with File > Open Project." % out_path
+    return True, text, summary, settings
+
+
 if orca is not None:
 
-    class ArrangeByHeight(orca.script.ScriptPluginCapabilityBase):
+    class ArrangeByHeightPage(orca.pages.PagesPluginCapabilityBase):
+        """The Arrange by Height tab in the main window."""
+
         def get_name(self):
             return "Arrange by Height"
+
+        def get_icon(self):
+            try:
+                path = os.path.join(orca.host.plugin.storage(), "arrange_by_height.svg")
+                if not os.path.exists(path):
+                    with open(path, "w") as fh:
+                        fh.write(ICON_SVG)
+                return path
+            except Exception:
+                return ""
+
+        def get_ui(self):
+            return PAGE_HTML
 
         def get_default_config(self):
             return dict(DEFAULT_SETTINGS, manual_gap="6")
 
-        def _settings(self):
+        def _saved(self):
             try:
                 config = json.loads(self.get_config() or "{}")
             except ValueError:
@@ -968,63 +1329,48 @@ if orca is not None:
             merged.update({k: v for k, v in config.items() if k in merged})
             return merged
 
-        def execute(self):
-            plater = orca.host.plater()
-            model = orca.host.model()
-            if model.object_count() == 0:
-                return orca.ExecutionResult.skipped("The plate is empty.")
-            storage = orca.host.plugin.storage()
-            settings = self._settings()
-            init = dict(settings, out=_default_output(plater.project_path(), storage))
-            html = DIALOG_HTML.replace("__INIT__", json.dumps(init))
-            answer = orca.host.ui.show_dialog(html=html, title="Arrange by Height",
-                                              width=460, height=600)
-            if not answer or not answer.get("ok"):
-                return orca.ExecutionResult.skipped("Canceled.")
-            spacing = answer.get("spacing", "auto")
-            if spacing != "auto":
-                try:
-                    spacing = str(max(float(spacing), 0.0))
-                except (TypeError, ValueError):
-                    return orca.ExecutionResult.failure(
-                        orca.PluginResult.RecoverableError, "Spacing must be a number in mm.")
-            settings = {
-                "spacing": spacing,
-                "manual_gap": answer.get("manual_gap") or settings["manual_gap"],
-                "layout": answer.get("layout") or "compact",
-                "plates": answer.get("plates") or "keep",
-            }
-            self.save_config(json.dumps(settings))
-            out_path = (answer.get("out") or "").strip()
-            if not out_path.lower().endswith(".3mf"):
-                return orca.ExecutionResult.failure(
-                    orca.PluginResult.RecoverableError, "The output file must end in .3mf.")
-
-            export_path = os.path.join(storage, "export.3mf")
+        def _push_state(self):
+            state = {"type": "state", "settings": self._saved()}
             try:
-                plater.export_3mf_copy(export_path)
-                # Bounding boxes from the live model are exact and fast. The exported
-                # build lists the instances in the same order.
-                summary = arrange_file(export_path, out_path, settings, _live_bboxes())
-            except Exception as err:  # Shown to the user; the plugin must not crash OrcaSlicer.
-                text = str(err) or err.__class__.__name__
-                orca.host.ui.message(text, title="Arrange by Height", icon="warning")
-                return orca.ExecutionResult.failure(orca.PluginResult.RecoverableError, text)
-            finally:
+                state["out"] = _default_output(orca.host.plater().project_path(),
+                                               orca.host.plugin.storage())
+            except Exception:
+                pass
+            try:
+                structure = orca.host.preset_bundle().full_config_value("printer_structure")
+                state["printer"] = bool(structure)
+                state["bedslinger"] = _str(structure) == "i3"
+            except Exception:
+                pass
+            self.post_message(state)
+
+        def on_message(self, data):
+            if isinstance(data, str):
+                data = json.loads(data)
+            kind = (data or {}).get("type")
+            if kind == "ready":
+                self._push_state()
+            elif kind == "arrange":
+                ok, text, summary, settings = run_live(
+                    data.get("settings"), data.get("out"), self._saved())
+                if settings:
+                    self.save_config(json.dumps(settings))
+                self.post_message({"type": "result", "ok": ok, "text": text,
+                                   "summary": summary})
+
+        def on_lifecycle_event(self, event, ctx):
+            if event in (orca.LifecycleEvent.ProjectOpened, orca.LifecycleEvent.NewProject,
+                         orca.LifecycleEvent.ProjectAfterSave,
+                         orca.LifecycleEvent.PresetSelected):
                 try:
-                    os.remove(export_path)
-                except OSError:
+                    self._push_state()
+                except Exception:
                     pass
-            text = ("Arranged %d objects on %d plates.\n\nSaved to:\n%s\n\n"
-                    "Open it with File > Open Project." % (
-                        summary["objects"], summary["plates"], out_path))
-            orca.host.ui.message(text, title="Arrange by Height", icon="info")
-            return orca.ExecutionResult.success(text)
 
     @orca.plugin
     class ArrangeByHeightPlugin(orca.base):
         def register_capabilities(self):
-            orca.register_capability(ArrangeByHeight)
+            orca.register_capability(ArrangeByHeightPage)
 
 
 # ---------------------------------------------------------------------------
@@ -1038,6 +1384,8 @@ def main(argv=None):
     parser.add_argument("--spacing", default="auto", help='gap between objects in mm, or "auto"')
     parser.add_argument("--layout", choices=("compact", "grid"), default="compact")
     parser.add_argument("--plates", choices=("keep", "regroup"), default="keep")
+    parser.add_argument("--align-y", choices=("auto", "on", "off"), default="auto",
+                        help="turn long objects along Y (auto: on for i3 printers)")
     args = parser.parse_args(argv)
     if args.spacing != "auto":
         try:
@@ -1045,13 +1393,15 @@ def main(argv=None):
         except ValueError:
             parser.error('--spacing must be a number or "auto"')
     out = args.output or os.path.splitext(args.input)[0] + "-arranged.3mf"
-    settings = {"spacing": args.spacing, "layout": args.layout, "plates": args.plates}
+    settings = {"spacing": args.spacing, "layout": args.layout, "plates": args.plates,
+                "align_y": args.align_y}
     try:
         summary = arrange_file(args.input, out, settings)
     except ArrangeError as err:
         print("Error: %s" % err, file=sys.stderr)
         return 1
-    print("Arranged %d objects on %d plates: %s" % (summary["objects"], summary["plates"], out))
+    print("Arranged %s on %s: %s" % (_count(summary["objects"], "object"),
+                                     _count(summary["plates"], "plate"), out))
     return 0
 
 
