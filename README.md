@@ -85,8 +85,18 @@ the last plugin tab.
 | Manual | the value entered, in mm |
 
 These are the same rules OrcaSlicer's own Auto Arrange uses. A plate with its own print
-sequence uses that print sequence. When a brim is on, objects also keep a brim width from
-the bed edge.
+sequence uses that print sequence. With **Skirt type: Per object**, the skirt also fits
+between objects.
+
+### Edge Margin
+
+| Setting | Room between the bed edge and the objects |
+|---|---|
+| Auto | 1 mm (5 mm printing by object) + skirt (skirt distance + skirt loops x first layer line width) + brim, as OrcaSlicer's arrange |
+| Manual | the value entered, in mm |
+
+Use Manual for more room, for example to keep parts away from an edge where first layer
+adhesion is poor.
 
 ### Align to Y Axis
 
@@ -178,7 +188,7 @@ python arrange_by_height.py project.3mf
 ```
 
 ```bash
-python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --plates current --plate 2 --align-y on --adaptive 0.35 --smooth 5 --each-separately
+python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --edge-margin 8 --plates current --plate 2 --align-y on --adaptive 0.35 --smooth 5 --each-separately
 ```
 
 From the command line the plugin reads the object geometry from the 3MF, which is slower for

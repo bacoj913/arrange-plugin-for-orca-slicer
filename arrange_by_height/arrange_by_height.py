@@ -6,7 +6,7 @@
 # name = "Arrange by Height"
 # description = "Arranges plates by object height, tallest in the middle. Adds an Arrange tab."
 # author = "bacoj913"
-# version = "1.2.0"
+# version = "1.3.0"
 # ///
 """Arrange by Height: an OrcaSlicer plugin and command-line tool.
 
@@ -66,8 +66,11 @@ XML_INDEXED_PATHS = ("Metadata/layer_config_ranges.xml", "Metadata/cut_informati
 PLATE_GAP = 1.0 / 5.0
 MAX_OUTER_NOZZLE_DIAMETER = 4.0
 MAX_PLATE_COUNT = 36
+BED_SHRINK = 1.0             # mm kept from the bed edge (ArrangeParams::bed_shrink_x)
+BED_SHRINK_SEQ_PRINT = 5.0   # the same, printing by object
 DEFAULT_SETTINGS = {
     "spacing": "auto",       # "auto" or a number in mm
+    "edge_margin": "auto",   # "auto" or a number in mm
     "layout": "compact",     # "compact", "rows" or "grid"
     "plates": "current",     # "current" (the plate in plate_index), "keep" or "regroup"
     "output": "new",         # "new" file or "replace" the project file
@@ -354,10 +357,10 @@ def auto_gap(config, print_sequence, items):
         if items and all(it.height < nozzle_height for it in items):
             return MAX_OUTER_NOZZLE_DIAMETER + 0.01
         return _num(config.get("extruder_clearance_radius"), 40.0) + 0.01
-    brim = 0.0
-    if _str(config.get("brim_type"), "auto_brim") != "no_brim":
-        brim = _num(config.get("brim_width")) + _num(config.get("brim_object_gap"))
-    return max(2.0 * brim, MIN_AUTO_GAP)
+    gap = 2.0 * brim_extent(config)
+    if per_object_skirt(config):
+        gap += 2.0 * skirt_extent(config)
+    return max(gap, MIN_AUTO_GAP)
 
 
 def align_enabled(settings, config):
@@ -370,11 +373,44 @@ def align_enabled(settings, config):
     return _str(config.get("printer_structure")) == "i3"
 
 
-def edge_margin(config):
-    """Room left at the bed edge for a brim."""
+def brim_extent(config):
+    """How far a brim reaches from an object."""
     if _str(config.get("brim_type"), "auto_brim") == "no_brim":
         return 0.0
     return _num(config.get("brim_width")) + _num(config.get("brim_object_gap"))
+
+
+def skirt_extent(config):
+    """How far a skirt reaches past the brim (get_real_skirt_dist in PrintConfig.cpp)."""
+    loops = int(_num(config.get("skirt_loops"), 0))
+    shield = _str(config.get("draft_shield"), "disabled") not in ("disabled", "0", "")
+    if not ((int(_num(config.get("skirt_height"), 0)) > 0 and loops > 0) or shield):
+        return 0.0
+    if shield and loops == 0:
+        loops = 1
+    nozzle = max([_at(config.get("nozzle_diameter"), i) for i in range(
+        len(config.get("nozzle_diameter") or [0.4]))] or [0.4]) or 0.4
+    width = 0.0
+    for key in ("initial_layer_line_width", "line_width"):
+        value = _str(config.get(key), "")
+        width = (nozzle * _num(value[:-1]) / 100.0 if value.endswith("%")
+                 else _num(value))
+        if width > 0:
+            break
+    if width <= 0:
+        width = nozzle
+    return _num(config.get("skirt_distance")) + loops * width
+
+
+def per_object_skirt(config):
+    return _str(config.get("skirt_type"), "combined") == "perobject"
+
+
+def edge_margin(config, print_sequence="by layer"):
+    """Room OrcaSlicer's arrange leaves at the bed edge: 1 mm (5 mm printing by object),
+    the skirt and the brim (update_arrange_params in Arrange.cpp)."""
+    base = BED_SHRINK_SEQ_PRINT if print_sequence == "by object" else BED_SHRINK
+    return base + skirt_extent(config) + brim_extent(config)
 
 
 # ---------------------------------------------------------------------------
@@ -633,9 +669,16 @@ def arrange(items, bed, plate_count, settings, config, plate_sequences=None):
     """Assign items to plates and place them. Returns the new plate count."""
     layouts = {"grid": layout_grid, "rows": layout_rows}
     layout = layouts.get(settings.get("layout"), layout_compact)
-    margin = edge_margin(config)
     plate_sequences = plate_sequences or {}
     global_sequence = _str(config.get("print_sequence"), "by layer")
+
+    def margin_for(plate):
+        value = settings.get("edge_margin", "auto")
+        if value in (None, "", "auto"):
+            return edge_margin(config, plate_sequences.get(plate, global_sequence))
+        return max(float(value), 0.0)
+
+    margin = min(margin_for(p) for p in range(max(plate_count, 1)))
 
     def gap_for(plate, plate_items):
         spacing = settings.get("spacing", "auto")
@@ -661,14 +704,14 @@ def arrange(items, bed, plate_count, settings, config, plate_sequences=None):
             while lo < hi:
                 mid = (lo + hi + 1) // 2
                 trial = queue[:mid]
-                if layout(trial, bed, gap_for(plate, trial), margin):
+                if layout(trial, bed, gap_for(plate, trial), margin_for(plate)):
                     hi = mid - 1
                 else:
                     lo = mid
             if lo == 0:
                 raise ArrangeError("Object %s does not fit on a plate." % queue[0].object_id)
             chosen = queue[:lo]
-            layout(chosen, bed, gap_for(plate, chosen), margin)
+            layout(chosen, bed, gap_for(plate, chosen), margin_for(plate))
             for it in chosen:
                 it.plate = plate
             plates.append(chosen)
@@ -692,7 +735,7 @@ def arrange(items, bed, plate_count, settings, config, plate_sequences=None):
             raise ArrangeError("Plate %d is empty." % (target + 1))
         for it in chosen:
             it.moved = True
-        overflow = layout(chosen, bed, gap_for(target, chosen), margin)
+        overflow = layout(chosen, bed, gap_for(target, chosen), margin_for(target))
         for it in overflow:
             chosen.remove(it)
         # Objects that do not fit go to new plates at the end.
@@ -710,7 +753,8 @@ def arrange(items, bed, plate_count, settings, config, plate_sequences=None):
         plates = [groups.get(p, []) for p in range(max([plate_count] + [p + 1 for p in groups]))]
         overflow = []
         for plate, plate_items in enumerate(plates):
-            rejected = layout(plate_items, bed, gap_for(plate, plate_items), margin)
+            rejected = layout(plate_items, bed, gap_for(plate, plate_items),
+                              margin_for(plate))
             for it in rejected:
                 plate_items.remove(it)
             overflow.extend(rejected)
@@ -1979,6 +2023,7 @@ select { min-width: 90px; }
 .plate rect.obj { stroke: rgba(0, 0, 0, 0.6); stroke-width: 0.6; }
 .plate text { font-size: 7px; fill: #111; text-anchor: middle; dominant-baseline: middle; }
 .legend { display: flex; align-items: center; gap: 8px; font-size: 12px; margin: 0 0 12px; }
+.legend[hidden] { display: none; }
 .legend .bar { width: 140px; height: 10px;
   background: linear-gradient(90deg, hsl(210,70%,60%), hsl(110,70%,52%), hsl(20,70%,45%)); }
 </style></head><body>
@@ -1987,10 +2032,17 @@ select { min-width: 90px; }
 <h2>Arrange by Height</h2>
 <fieldset><legend>Spacing</legend>
   <label><input type="radio" name="spacing" value="auto"> Auto</label>
-  <div class="note">By layer: brim width on each side, at least 2 mm.
-    By object: extruder clearance radius.</div>
+  <div class="note">By layer: brim width on each side (and a per-object skirt), at least
+    2 mm. By object: extruder clearance radius.</div>
   <label><input type="radio" name="spacing" value="manual"> Manual
     <input type="number" id="gap" min="0" step="0.5"> mm</label>
+</fieldset>
+<fieldset><legend>Edge Margin</legend>
+  <label><input type="radio" name="edge" value="auto"> Auto</label>
+  <div class="note">Skirt, brim and 1 mm (5 mm by object), as OrcaSlicer's arrange.</div>
+  <label><input type="radio" name="edge" value="manual"> Manual
+    <input type="number" id="edge" min="0" step="0.5"> mm</label>
+  <div class="note">From the bed edge to the objects.</div>
 </fieldset>
 <fieldset><legend>Layout</legend>
   <label><input type="radio" name="layout" value="compact"> Compact</label>
@@ -2076,6 +2128,11 @@ function applyState(st) {
     document.getElementById('gap').value = s.spacing === 'auto' ? s.manual_gap : s.spacing;
   }
   if (s.layout) pick('layout', s.layout);
+  if (s.edge_margin !== undefined) {
+    pick('edge', s.edge_margin === 'auto' ? 'auto' : 'manual');
+    document.getElementById('edge').value = s.edge_margin === 'auto' ? s.manual_edge
+                                                                      : s.edge_margin;
+  }
   if (s.plates) pick('plates', s.plates);
   if (s.align_y) document.getElementById('align').value = s.align_y;
   if (s.output) pick('output', s.output);
@@ -2165,6 +2222,8 @@ function settings() {
   return {
     spacing: manual ? document.getElementById('gap').value : 'auto',
     manual_gap: document.getElementById('gap').value,
+    edge_margin: value('edge') === 'manual' ? document.getElementById('edge').value : 'auto',
+    manual_edge: document.getElementById('edge').value,
     layout: value('layout'),
     plates: value('plates'),
     align_y: document.getElementById('align').value,
@@ -2198,6 +2257,8 @@ orca.onMessage(function (msg) {
   }
 });
 pick('spacing', 'auto');
+pick('edge', 'auto');
+document.getElementById('edge').value = 5;
 pick('layout', 'compact');
 pick('plates', 'current');
 pick('output', 'new');
@@ -2250,8 +2311,16 @@ def _clean_settings(raw, saved):
             spacing = str(max(float(spacing), 0.0))
         except (TypeError, ValueError):
             raise ArrangeError("Spacing must be a number in mm.")
+    edge = raw.get("edge_margin", "auto")
+    if edge != "auto":
+        try:
+            edge = str(max(float(edge), 0.0))
+        except (TypeError, ValueError):
+            raise ArrangeError("Edge margin must be a number in mm.")
     return {
         "spacing": spacing,
+        "edge_margin": edge,
+        "manual_edge": str(raw.get("manual_edge") or saved.get("manual_edge") or "5"),
         "manual_gap": str(raw.get("manual_gap") or saved.get("manual_gap") or "6"),
         "layout": (raw.get("layout") if raw.get("layout") in ("compact", "rows", "grid")
                    else "compact"),
@@ -2358,14 +2427,14 @@ if orca is not None:
             return PAGE_HTML
 
         def get_default_config(self):
-            return dict(DEFAULT_SETTINGS, manual_gap="6")
+            return dict(DEFAULT_SETTINGS, manual_gap="6", manual_edge="5")
 
         def _saved(self):
             try:
                 config = json.loads(self.get_config() or "{}")
             except ValueError:
                 config = {}
-            merged = dict(DEFAULT_SETTINGS, manual_gap="6")
+            merged = dict(DEFAULT_SETTINGS, manual_gap="6", manual_edge="5")
             merged.update({k: v for k, v in config.items() if k in merged})
             return merged
 
@@ -2428,6 +2497,8 @@ def main(argv=None):
     parser.add_argument("-o", "--output", help="output file (default: <input>-arranged.3mf)")
     parser.add_argument("--spacing", default="auto", help='gap between objects in mm, or "auto"')
     parser.add_argument("--layout", choices=("compact", "rows", "grid"), default="compact")
+    parser.add_argument("--edge-margin", default="auto",
+                        help='room at the bed edge in mm, or "auto"')
     parser.add_argument("--plates", choices=("all", "regroup", "current"), default="all",
                         help="all: every plate, objects stay on their plate; "
                              "current: only the plate given with --plate")
@@ -2442,13 +2513,18 @@ def main(argv=None):
     parser.add_argument("--align-y", choices=("auto", "on", "off"), default="auto",
                         help="turn long objects along Y (auto: on for i3 printers)")
     args = parser.parse_args(argv)
+    if args.edge_margin != "auto":
+        try:
+            float(args.edge_margin)
+        except ValueError:
+            parser.error('--edge-margin must be a number or "auto"')
     if args.spacing != "auto":
         try:
             float(args.spacing)
         except ValueError:
             parser.error('--spacing must be a number or "auto"')
     out = args.output or os.path.splitext(args.input)[0] + "-arranged.3mf"
-    settings = {"spacing": args.spacing, "layout": args.layout,
+    settings = {"spacing": args.spacing, "layout": args.layout, "edge_margin": args.edge_margin,
                 "plates": "keep" if args.plates == "all" else args.plates,
                 "plate_index": args.plate - 1, "align_y": args.align_y,
                 "adaptive": args.adaptive is not None,

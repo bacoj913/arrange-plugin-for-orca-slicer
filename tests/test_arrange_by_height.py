@@ -751,6 +751,58 @@ class SharedLayersTest(Base):
         self.assertEqual(abh.format_duration(125 * 60 + 10), "2 h 05 min")
 
 
+class EdgeMarginTest(Base):
+    def min_edge(self, project):
+        """Smallest distance from a part to the edge of its own plate."""
+        bed = project.bed
+        cols = abh.plate_columns(project.plate_count)
+        out = []
+        for it in project.items:
+            ox, oy = abh.plate_origin(it.plate, cols, bed)
+            b = (it.bbox[0] - ox, it.bbox[1] - oy, it.bbox[3] - ox, it.bbox[4] - oy)
+            out.append(min(b[0] - bed.x0, b[1] - bed.y0, bed.x1 - b[2], bed.y1 - b[3]))
+        return min(out)
+
+    def many(self):
+        # Enough parts to reach the bed edges.
+        return [(45, 45, 10 + i, [translate(30, 30)]) for i in range(16)]
+
+    def test_skirt_extent(self):
+        cfg = {"skirt_loops": "2", "skirt_height": "1", "skirt_distance": "3",
+               "nozzle_diameter": ["0.4"], "initial_layer_line_width": "0.5"}
+        self.assertAlmostEqual(abh.skirt_extent(cfg), 4.0)
+        cfg["initial_layer_line_width"] = "125%"
+        self.assertAlmostEqual(abh.skirt_extent(cfg), 4.0)
+        self.assertEqual(abh.skirt_extent(dict(cfg, skirt_loops="0")), 0.0)
+        self.assertAlmostEqual(abh.skirt_extent(dict(cfg, skirt_loops="0",
+                                                     draft_shield="enabled")), 3.5)
+
+    def test_auto_counts_skirt_and_brim(self):
+        cfg = {"brim_type": "outer_only", "brim_width": "3", "brim_object_gap": "0",
+               "skirt_loops": "1", "skirt_height": "1", "skirt_distance": "2",
+               "initial_layer_line_width": "0.5"}
+        _, project, _ = self.run_arrange(self.many(), {"spacing": "2"}, config=cfg)
+        self.assertGreaterEqual(self.min_edge(project), 1 + 2.5 + 3 - 1e-6)
+        self.assertEqual(abh.edge_margin(dict(cfg), "by object"), 5 + 2.5 + 3)
+
+    def test_manual(self):
+        summary, project, _ = self.run_arrange(self.many(), {"spacing": "2",
+                                                             "edge_margin": "12"})
+        self.assertGreaterEqual(self.min_edge(project), 12 - 1e-6)
+        self.assertEqual(summary["plates"], 2)
+        # 4 x 45 mm + 3 x 2 mm = 186 mm: all fit on the 200 mm bed only with a small margin.
+        summary, project, _ = self.run_arrange(self.many(), {"spacing": "2",
+                                                             "edge_margin": "0"})
+        self.assertEqual(summary["plates"], 1)
+
+    def test_per_object_skirt_gap(self):
+        cfg = {"skirt_type": "perobject", "skirt_loops": "1", "skirt_height": "1",
+               "skirt_distance": "2", "initial_layer_line_width": "0.5"}
+        objects = [(20, 20, 10 + i, [translate(30 + 25 * i, 30)]) for i in range(4)]
+        _, project, _ = self.run_arrange(objects, config=cfg)
+        self.assert_valid(project, 5.0)
+
+
 class FakeOrca:
     """The parts of OrcaSlicer's embedded `orca` module the plugin uses."""
 
@@ -905,7 +957,7 @@ class CommandLineTest(Base):
         make_project(self.src, [(20, 20, 10, [translate(50, 50)])])
         self.assertEqual(abh.main([self.src, "-o", self.out, "--spacing", "3",
                                    "--align-y", "on", "--layout", "rows",
-                                   "--plates", "current", "--plate", "1",
+                                   "--plates", "current", "--plate", "1", "--edge-margin", "4",
                                    "--adaptive", "0.4", "--smooth", "4", "--keep-min"]), 0)
         with zipfile.ZipFile(self.out) as zf:
             self.assertIn(abh.LAYER_HEIGHTS_PATH, zf.namelist())
