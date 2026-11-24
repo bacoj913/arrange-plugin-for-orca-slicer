@@ -602,7 +602,8 @@ class LayerHeightTest(Base):
         existing = "object_id=1|0;0.2;0.2;0.2;2;0.08;4;0.28;6;0.08;8;0.28;10;0.2\n"
         make_project(self.src, objects, extra_files={abh.LAYER_HEIGHTS_PATH: existing})
         summary = abh.arrange_file(self.src, self.out, dict(
-            abh.DEFAULT_SETTINGS, plates="keep", smooth=True, smooth_radius=2))
+            abh.DEFAULT_SETTINGS, plates="keep", smooth=True, smooth_radius=2,
+            share_layers=False))
         self.assertEqual(summary["layer_heights"], 1)
         with zipfile.ZipFile(self.out) as zf:
             profiles = abh.parse_profiles(zf.read(abh.LAYER_HEIGHTS_PATH).decode())
@@ -638,6 +639,116 @@ class LayerHeightTest(Base):
         project.load_bboxes()
         self.assertAlmostEqual(project.items[0].width, 20)
         self.assertAlmostEqual(project.items[0].height, 10)
+
+
+def tube_triangles(w, wall, h, x=0.0, y=0.0):
+    """A square tube (open top and bottom rims), outer side w."""
+    def quad(a, b, c, d):
+        return [(a, b, c), (a, c, d)]
+    o = [(x, y), (x + w, y), (x + w, y + w), (x, y + w)]
+    i = [(x + wall, y + wall), (x + w - wall, y + wall), (x + w - wall, y + w - wall),
+         (x + wall, y + w - wall)]
+    t = []
+    for k in range(4):
+        a, b = o[k], o[(k + 1) % 4]
+        t += quad((a[0], a[1], 0), (b[0], b[1], 0), (b[0], b[1], h), (a[0], a[1], h))
+        a, b = i[k], i[(k + 1) % 4]
+        t += quad((b[0], b[1], 0), (a[0], a[1], 0), (a[0], a[1], h), (b[0], b[1], h))
+        n = (k + 1) % 4
+        t += quad((o[k][0], o[k][1], h), (o[n][0], o[n][1], h), (i[n][0], i[n][1], h),
+                  (i[k][0], i[k][1], h))
+        t += quad((o[k][0], o[k][1], 0), (i[k][0], i[k][1], 0), (i[n][0], i[n][1], 0),
+                  (o[n][0], o[n][1], 0))
+    return t
+
+
+class SharedLayersTest(Base):
+    CONFIG = {"layer_height": "0.2", "initial_layer_print_height": "0.2",
+              "min_layer_height": ["0.08"], "max_layer_height": ["0.28"],
+              "nozzle_diameter": ["0.4"]}
+
+    def test_cross_section(self):
+        box = abh.CrossSection(LayerHeightTest.mesh(self, "box", 20, 30, 10))
+        for length, area in box.sample([0.1, 5.0, 9.9]):
+            self.assertAlmostEqual(length, 100, places=6)
+            self.assertAlmostEqual(area, 600, places=6)
+        tube = abh.CrossSection(tube_triangles(20, 1.6, 50, 10, 10))
+        length, area = tube.sample([25.0])[0]
+        self.assertAlmostEqual(length, 80 + 4 * 16.8, places=6)
+        self.assertAlmostEqual(area, 400 - 16.8 ** 2, places=6)
+        pyramid = abh.CrossSection(LayerHeightTest.mesh(self, "pyramid", 40, 40, 20))
+        length, area = pyramid.sample([10.0])[0]
+        self.assertAlmostEqual(length, 80, places=6)
+        self.assertAlmostEqual(area, 400, places=6)
+
+    def test_merge_and_fit(self):
+        a = [0.0, 0.2, 0.2, 0.2, 5.0, 0.28, 10.0, 0.28]
+        b = [0.0, 0.2, 0.2, 0.2, 2.0, 0.1, 4.0, 0.1]
+        merged = abh.merge_finest([a, b])
+        self.assertEqual(merged[:4], [0.0, 0.2, 0.2, 0.2])
+        self.assertAlmostEqual(merged[-2], 10.0)
+        heights = dict(zip(merged[0::2], merged[1::2]))
+        for z, h in heights.items():
+            if 2.0 <= z <= 4.0:
+                self.assertLessEqual(h, 0.1 + 1e-9)
+        fit = abh.fit_to_height(merged, 4.0)
+        self.assertAlmostEqual(fit[-2], 4.0)
+        self.assertTrue(all(z <= 4.0 for z in fit[0::2]))
+
+    def test_object_layers(self):
+        params = abh.SlicingParams(self.CONFIG, {}, 10.0)
+        layers = abh.object_layers(params, abh.default_profile(params))
+        self.assertEqual(len(layers), 50)
+        self.assertEqual(layers[0], (0.0, 0.2))
+        self.assertAlmostEqual(layers[-1][1], 10.0, places=6)
+
+    def objects(self):
+        # A pyramid and a short cone-like pyramid: different adaptive profiles.
+        return [(60, 60, 20, [translate(60, 60)], "pyramid"),
+                (40, 40, 12, [translate(150, 150)], "pyramid")]
+
+    def test_shared_profile_aligns_layers(self):
+        # Small parts with a minimum layer time: extra plate layers cost the most.
+        objects = [(16, 16, 20, [translate(60, 60)], "pyramid"),
+                   (12, 12, 12, [translate(150, 150)], "pyramid")]
+        make_project(self.src, objects, config=dict(self.CONFIG, slow_down_layer_time=["8"]))
+        shared = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="keep", adaptive=True, adaptive_quality=0.3))
+        with zipfile.ZipFile(self.out) as zf:
+            profiles = abh.parse_profiles(zf.read(abh.LAYER_HEIGHTS_PATH).decode())
+        low, high = sorted(profiles.values(), key=lambda p: p[-2])
+        self.assertAlmostEqual(low[-2], 12, places=3)
+        # The shorter object follows the taller one's profile up to its own top.
+        self.assertEqual(low[:-2], high[:len(low) - 2])
+        separate = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="keep", adaptive=True, adaptive_quality=0.3,
+            share_layers=False))
+        self.assertLess(shared["estimate"]["after_layers"],
+                        separate["estimate"]["after_layers"])
+        self.assertLess(shared["estimate"]["after"], separate["estimate"]["after"])
+
+    def test_estimate(self):
+        make_project(self.src, self.objects(), config=self.CONFIG)
+        plain = abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS, plates="keep"))
+        est = plain["estimate"]
+        self.assertGreater(est["before"], 0)
+        # Only the layout changed: same layers, a similar time.
+        self.assertEqual(est["before_layers"], est["after_layers"])
+        self.assertEqual(est["before_layers"], 100)
+        self.assertLess(abs(est["after"] - est["before"]), 0.05 * est["before"])
+        fine = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="keep", adaptive=True, adaptive_quality=0.0))
+        self.assertGreater(fine["estimate"]["after"], est["after"])
+
+    def test_estimate_text(self):
+        text = abh.estimate_text({"before": 3600, "after": 2700, "before_layers": 470,
+                                  "after_layers": 397})
+        self.assertIn("1 h 00 min before, 45 min after (-15 min, -25%)", text)
+        self.assertIn("470 before, 397 after", text)
+
+    def test_format_duration(self):
+        self.assertEqual(abh.format_duration(59 * 60), "59 min")
+        self.assertEqual(abh.format_duration(125 * 60 + 10), "2 h 05 min")
 
 
 class FakeOrca:
@@ -774,6 +885,7 @@ class PluginTest(Base):
         result = page.sent[-1]
         self.assertTrue(result["ok"], result["text"])
         self.assertIn("Don't Save", result["text"])
+        self.assertIn("Estimated print time", result["text"])
         backup = os.path.join(self.tmp.name, "brackets-backup.3mf")
         with open(backup, "rb") as a, open(self.src, "rb") as b:
             self.assertEqual(a.read(), b.read())

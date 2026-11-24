@@ -6,7 +6,7 @@
 # name = "Arrange by Height"
 # description = "Arranges plates by object height, tallest in the middle. Adds an Arrange tab."
 # author = "bacoj913"
-# version = "1.1.0"
+# version = "1.2.0"
 # ///
 """Arrange by Height: an OrcaSlicer plugin and command-line tool.
 
@@ -77,6 +77,7 @@ DEFAULT_SETTINGS = {
     "smooth": False,         # smooth the layer height profile
     "smooth_radius": 5,      # 1 ... 10
     "smooth_keep_min": False,
+    "share_layers": True,    # one layer height profile for all objects on a plate
 }
 MIN_AUTO_GAP = 2.0           # mm, used for "By layer" when there is no brim
 ROW_BAND = 20.0              # mm, row height used to order objects of equal height
@@ -946,6 +947,307 @@ def smooth_profile(profile, params, radius=5, keep_min=False):
     return profile
 
 
+def merge_finest(profiles):
+    """layer_height_profile_merge_finest in Slicing.cpp: the finest height any profile asks
+    for at each Z, so objects that share it print their layers at the same Z."""
+    tallest = max(profiles, key=lambda p: p[-2])
+    top = tallest[-2]
+    cursors = [0] * len(profiles)
+
+    def finest_at(z):
+        height = float("inf")
+        for k, prof in enumerate(profiles):
+            end = len(prof) - 2
+            prof_top = prof[end]
+            if z > prof_top + SLICE_EPSILON:
+                last = prof[end - 1]
+                height = min(height, math.sqrt(
+                    last * last + 2.0 * LAYER_HEIGHT_CHANGE_STEP * (z - prof_top)))
+                continue
+            i = cursors[k]
+            while i + 2 < end and prof[i + 2] <= z:
+                i += 2
+            cursors[k] = i
+            if i + 2 < end:
+                t = (z - prof[i]) / (prof[i + 2] - prof[i])
+                height = min(height, prof[i + 1] + (prof[i + 3] - prof[i + 1]) * t)
+            else:
+                height = min(height, prof[i + 1])
+        return height
+
+    out = [0.0, tallest[1]]
+    print_z = tallest[1]
+    if (len(tallest) >= 4 and abs(tallest[2] - print_z) < SLICE_EPSILON
+            and abs(tallest[3] - print_z) < SLICE_EPSILON):
+        out += [print_z, print_z]
+    while print_z + SLICE_EPSILON < top:
+        height = finest_at(print_z)
+        if height < SLICE_EPSILON:
+            break
+        out += [print_z, height]
+        print_z += height
+    out += [top, out[-2]]
+    return out
+
+
+def fit_to_height(profile, object_height):
+    """layer_height_profile_fit_to_height in Slicing.cpp."""
+    out = []
+    i = 0
+    while i < len(profile) and profile[i] < object_height - SLICE_EPSILON:
+        out += [profile[i], profile[i + 1]]
+        i += 2
+    height = profile[-1]
+    if i < len(profile) and i >= 2:
+        z1, z2 = profile[i - 2], profile[i]
+        t = min(max((object_height - z1) / (z2 - z1), 0.0), 1.0) if z2 != z1 else 0.0
+        height = profile[i - 1] + (profile[i + 1] - profile[i - 1]) * t
+    out += [object_height, height]
+    return out
+
+
+def default_profile(params, height_ranges=()):
+    """The profile OrcaSlicer uses for an object without one: the layer height, with
+    height range modifiers."""
+    out = [0.0, params.layer_height]
+    for lo, hi, h in sorted(height_ranges):
+        out += [lo, params.layer_height, lo, h, hi, h, hi, params.layer_height]
+    out += [params.object_height, params.layer_height]
+    return out
+
+
+def valid_profile(profile, params):
+    """Whether OrcaSlicer would use this profile (PrintObject::update_layer_height_profile)."""
+    return (profile is not None and len(profile) >= 4 and len(profile) % 2 == 0
+            and abs(profile[-2] - params.object_height) <= 1e-3
+            and abs(profile[1] - params.first_object_layer_height) < 1e-6)
+
+
+def object_layers(params, profile):
+    """generate_object_layers in Slicing.cpp: [(bottom z, top z), ...]."""
+    out = []
+    print_z = 0.0
+    if params.first_layer_fixed:
+        print_z = params.first_object_layer_height
+        out.append((0.0, print_z))
+    idx = 0
+    n = len(profile)
+    slice_z = print_z + 0.5 * params.min_layer_height
+    while slice_z < params.object_height:
+        height = params.min_layer_height
+        if idx < n:
+            nxt = idx + 2
+            while nxt < n and slice_z >= profile[nxt]:
+                idx = nxt
+                nxt += 2
+            z1, h1 = profile[idx], profile[idx + 1]
+            height = h1
+            if nxt < n:
+                z2, h2 = profile[nxt], profile[nxt + 1]
+                height = h1 + (h2 - h1) * (slice_z - z1) / (z2 - z1) if z2 != z1 else h1
+        height = max(height, params.min_layer_height)
+        slice_z = print_z + 0.5 * height
+        if slice_z >= params.object_height:
+            break
+        out.append((print_z, print_z + height))
+        print_z += height
+        slice_z = print_z + 0.5 * params.min_layer_height
+    return out
+
+
+class CrossSection:
+    """Outline length and solid area of an object's horizontal cross-sections.
+
+    Along each triangle, the cut segment's ends move linearly with Z, so the outline
+    length is piecewise linear and the area piecewise quadratic in Z. Both are summed with
+    a sweep over the triangles' Z ranges instead of cutting each layer.
+    """
+
+    def __init__(self, triangles):
+        z_min = min(min(t[0][2], t[1][2], t[2][2]) for t in triangles)
+        events = []
+        for tri in triangles:
+            a, b, c = tri
+            nx = (b[1] - a[1]) * (c[2] - a[2]) - (b[2] - a[2]) * (c[1] - a[1])
+            ny = (b[2] - a[2]) * (c[0] - a[0]) - (b[0] - a[0]) * (c[2] - a[2])
+            if abs(nx) < 1e-12 and abs(ny) < 1e-12:
+                continue
+            v0, v1, v2 = sorted(((p[0], p[1], p[2] - z_min) for p in tri), key=lambda p: p[2])
+            for lo, hi, e1, e2 in ((v0, v1, (v0, v1), (v0, v2)), (v1, v2, (v1, v2), (v0, v2))):
+                z0, z1 = lo[2], hi[2]
+                if z1 - z0 < 1e-9:
+                    continue
+                pa, pb = self._line(e1)
+                qa, qb = self._line(e2)
+                # Segment p -> q: material on the left, so the outward normal is on the right.
+                zm = 0.5 * (z0 + z1)
+                dx = (qa[0] + qb[0] * zm) - (pa[0] + pb[0] * zm)
+                dy = (qa[1] + qb[1] * zm) - (pa[1] + pb[1] * zm)
+                sign = 1.0 if nx * dy - ny * dx > 0 else -1.0
+                c0 = sign * (pa[0] * qa[1] - pa[1] * qa[0])
+                c1 = sign * (pa[0] * qb[1] + pb[0] * qa[1] - pa[1] * qb[0] - pb[1] * qa[0])
+                c2 = sign * (pb[0] * qb[1] - pb[1] * qb[0])
+                l0 = math.hypot((qa[0] + qb[0] * z0) - (pa[0] + pb[0] * z0),
+                                (qa[1] + qb[1] * z0) - (pa[1] + pb[1] * z0))
+                l1 = math.hypot((qa[0] + qb[0] * z1) - (pa[0] + pb[0] * z1),
+                                (qa[1] + qb[1] * z1) - (pa[1] + pb[1] * z1))
+                m = (l1 - l0) / (z1 - z0)
+                coef = (m, l0 - m * z0, c0, c1, c2)
+                events.append((z0, 1, coef))
+                events.append((z1, -1, coef))
+        events.sort(key=lambda e: e[0])
+        self.events = events
+        self.height = max(max(t[0][2], t[1][2], t[2][2]) for t in triangles) - z_min
+
+    @staticmethod
+    def _line(edge):
+        """(x, y) = a + b * z along an edge."""
+        p, q = edge
+        dz = q[2] - p[2]
+        bx, by = (q[0] - p[0]) / dz, (q[1] - p[1]) / dz
+        return (p[0] - bx * p[2], p[1] - by * p[2]), (bx, by)
+
+    def sample(self, zs):
+        """[(outline length, area)] at each Z (ascending)."""
+        acc = [0.0] * 5
+        out = []
+        i = 0
+        for z in zs:
+            while i < len(self.events) and self.events[i][0] <= z:
+                _, sign, coef = self.events[i]
+                for k in range(5):
+                    acc[k] += sign * coef[k]
+                i += 1
+            length = acc[0] * z + acc[1]
+            area = 0.5 * (acc[4] * z * z + acc[3] * z + acc[2])
+            out.append((max(length, 0.0), max(area, 0.0)))
+        return out
+
+
+class TimeModel:
+    """A rough print time model, used to compare two versions of the same plates.
+
+    Per layer and object: walls (outline length x wall loops) and infill (the area inside
+    the walls; solid near the top and bottom), each at its speed, capped by the filament's
+    maximum volumetric speed. Per layer: travel between the objects, a retraction for each
+    object, a layer change, and the minimum layer time for cooling. Acceleration, support,
+    bridges and the purge are left out, so the absolute time is lower than OrcaSlicer's.
+    """
+
+    def __init__(self, config):
+        self.c = config
+        self.nozzle = _at(config.get("nozzle_diameter"), 0) or 0.4
+        self.loops = max(int(_num(config.get("wall_loops"), 2)), 1)
+        self.density = _num(str(_str(config.get("sparse_infill_density"), "15%")).rstrip("%"),
+                            15.0) / 100.0
+        self.max_flow = _at(config.get("filament_max_volumetric_speed"), 0) or 15.0
+        self.cooling = _str(config.get("slow_down_for_layer_cooling"), "1") not in ("0", "false")
+        self.layer_time = _at(config.get("slow_down_layer_time"), 0) if self.cooling else 0.0
+        self.travel = self.speed("travel_speed", 300.0)
+        self.retract = 0.0
+        length = _at(config.get("retraction_length"), 0)
+        rspeed = _at(config.get("retraction_speed"), 0) or 30.0
+        if length:
+            self.retract = 2.0 * length / rspeed
+        self.top_shell = (int(_num(config.get("top_shell_layers"), 3)),
+                          _num(config.get("top_shell_thickness"), 0.0))
+        self.bottom_shell = (int(_num(config.get("bottom_shell_layers"), 3)),
+                             _num(config.get("bottom_shell_thickness"), 0.0))
+        self.layer_height = _num(config.get("layer_height"), 0.2)
+
+    def speed(self, key, default):
+        return _num(self.c.get(key), default) or default
+
+    def width(self, key):
+        value = _str(self.c.get(key), "")
+        if not value or value in ("0", "0%"):
+            value = _str(self.c.get("line_width"), "")
+        if value.endswith("%"):
+            return self.nozzle * _num(value[:-1], 112.5) / 100.0
+        return _num(value, 0.0) or self.nozzle * 1.125
+
+    def _rate(self, speed, width, height):
+        return min(speed, self.max_flow / max(width * height, 1e-6))
+
+    def object_layer(self, length, area, height, first, solid):
+        """Seconds to print one layer of one object."""
+        if area <= 0 or length <= 0:
+            return 0.0
+        w_out, w_in = self.width("outer_wall_line_width"), self.width("inner_wall_line_width")
+        if first:
+            s_out = s_in = s_fill = self.speed("initial_layer_speed", 50.0)
+            s_fill = self.speed("initial_layer_infill_speed", s_fill)
+        else:
+            s_out = self.speed("outer_wall_speed", 100.0)
+            s_in = self.speed("inner_wall_speed", 150.0)
+            s_fill = (self.speed("internal_solid_infill_speed", 150.0) if solid
+                      else self.speed("sparse_infill_speed", 150.0))
+        # Walls cannot cover more than the area: thin parts get fewer loops.
+        wall_len = length * self.loops
+        cap = area / max(w_in, 1e-6)
+        scale = min(1.0, cap / wall_len) if wall_len > 0 else 0.0
+        t = scale * length * (1.0 / self._rate(s_out, w_out, height)
+                              + (self.loops - 1) / self._rate(s_in, w_in, height))
+        fill_area = max(area - length * (w_out + (self.loops - 1) * w_in), 0.0)
+        if fill_area > 0:
+            w_fill = self.width("sparse_infill_line_width")
+            fill_len = fill_area / w_fill * (1.0 if solid or first else self.density)
+            t += fill_len / self._rate(s_fill, w_fill, height)
+        return t
+
+    def is_solid(self, bottom, top, height_above, height_below):
+        layers, thickness = self.bottom_shell
+        if height_below < max(layers * self.layer_height, thickness) - SLICE_EPSILON:
+            return True
+        layers, thickness = self.top_shell
+        return height_above < max(layers * self.layer_height, thickness) - SLICE_EPSILON
+
+    def plate_time(self, objects):
+        """objects: [(center x, center y, layers, samples)] -> (seconds, plate layers)."""
+        by_z = {}
+        for k, (_x, _y, layers, samples) in enumerate(objects):
+            top = layers[-1][1] if layers else 0.0
+            for (z0, z1), (length, area) in zip(layers, samples):
+                solid = self.is_solid(z0, z1, top - z1, z0)
+                t = self.object_layer(length, area, z1 - z0, z0 < SLICE_EPSILON, solid)
+                key = round(z1, 4)
+                entry = by_z.setdefault(key, [0.0, set()])
+                entry[0] += t
+                entry[1].add(k)
+        total = 0.0
+        tours = {}
+        for key in sorted(by_z):
+            t, present = by_z[key]
+            t = max(t, self.layer_time)
+            members = frozenset(present)
+            if members not in tours:
+                tours[members] = self._tour([objects[k][:2] for k in sorted(members)])
+            total += t + tours[members] / self.travel + self.retract * len(members) + 0.2
+        return total, len(by_z)
+
+    @staticmethod
+    def _tour(points):
+        """Length of a nearest-neighbor loop through the points."""
+        if len(points) < 2:
+            return 0.0
+        left = list(points[1:])
+        cur = points[0]
+        length = 0.0
+        while left:
+            nxt = min(left, key=lambda p: (p[0] - cur[0]) ** 2 + (p[1] - cur[1]) ** 2)
+            length += math.hypot(nxt[0] - cur[0], nxt[1] - cur[1])
+            left.remove(nxt)
+            cur = nxt
+        return length + math.hypot(cur[0] - points[0][0], cur[1] - points[0][1])
+
+
+def format_duration(seconds):
+    minutes = int(round(seconds / 60.0))
+    if minutes < 60:
+        return "%d min" % minutes
+    return "%d h %02d min" % divmod(minutes, 60)
+
+
 def parse_profiles(text):
     """{object index: [floats]} from layer_heights_profile.txt."""
     out = {}
@@ -1313,11 +1615,46 @@ class Project:
                 order.append(it.object_id)
         return order
 
+    def _geometry(self):
+        """Per object: model-part triangles of its first instance and slicing parameters."""
+        if getattr(self, "_geom", None) is not None:
+            return self._geom
+        first_item = {}
+        for it in sorted(self.items, key=lambda i: i.index):
+            first_item.setdefault(it.object_id, it)
+        old_index = self._object_index(self._original_order())
+        existing = parse_profiles(self.indexed_files.get(LAYER_HEIGHTS_PATH))
+        ranges_xml = self.indexed_files.get("Metadata/layer_config_ranges.xml")
+        geom = {}
+        with zipfile.ZipFile(self.path) as zf:
+            lib = MeshLibrary(zf)
+            for object_id, it in first_item.items():
+                if not any(i.moved for i in self.items if i.object_id == object_id):
+                    continue
+                path = self.build[it.index][1] or "/" + MODEL_PATH
+                tris = lib.triangles(path, object_id, it.transform, parts=self._parts(object_id))
+                if not tris:
+                    continue
+                zs = [v[2] for t in tris for v in t]
+                obj_config = (self.info.get(object_id) or {}).get("config") or {}
+                params = SlicingParams(self.config, obj_config, max(zs) - min(zs))
+                ranges = parse_height_ranges(ranges_xml, old_index[object_id])
+                before = existing.get(old_index[object_id])
+                has_profile = valid_profile(before, params)
+                if not has_profile:
+                    before = default_profile(params, ranges)
+                geom[object_id] = {"tris": tris, "params": params, "ranges": ranges,
+                                   "before": before, "has_profile": has_profile}
+        self._geom = geom
+        return geom
+
     def layer_heights(self, settings):
         """Adaptive and smoothed layer heights for the moved objects.
 
-        Returns {object_id: profile}. Smooth without Adaptive smooths the object's existing
-        profile, as OrcaSlicer's Smooth button does.
+        Returns {object_id: profile}. As in the Variable Layer Height tool, objects on one
+        plate share one profile unless `share_layers` is off ("Each separately"); objects
+        whose first layer differs keep their own. Smooth without Adaptive smooths the
+        current profile.
         """
         adaptive = bool(settings.get("adaptive"))
         smooth = bool(settings.get("smooth"))
@@ -1326,40 +1663,89 @@ class Project:
         quality = min(max(float(settings.get("adaptive_quality", 0.5)), 0.0), 1.0)
         radius = min(max(int(settings.get("smooth_radius", 5)), 1), 10)
         keep_min = bool(settings.get("smooth_keep_min"))
-        old_index = self._object_index(self._original_order())
-        existing = parse_profiles(self.indexed_files.get(LAYER_HEIGHTS_PATH))
-        ranges_xml = self.indexed_files.get("Metadata/layer_config_ranges.xml")
-        moved = []
+        share = settings.get("share_layers", True) not in (False, "off", "0")
+        geom = self._geometry()
+        base = {}
+        for object_id, g in geom.items():
+            if adaptive:
+                base[object_id] = adaptive_profile(g["tris"], g["params"], quality, g["ranges"])
+            elif share or g["has_profile"]:
+                # Shared: the others follow the smoothed profile, as in OrcaSlicer.
+                base[object_id] = g["before"]
+        groups = {}
         for it in self.items:
-            if it.moved and it.object_id not in moved:
-                moved.append(it.object_id)
-        first_item = {}
-        for it in sorted(self.items, key=lambda i: i.index):
-            first_item.setdefault(it.object_id, it)
+            if it.object_id not in base:
+                continue
+            p = geom[it.object_id]["params"]
+            key = (it.plate, round(p.first_object_layer_height, 6), p.first_layer_fixed)
+            if share:
+                groups.setdefault(key, [])
+                if it.object_id not in groups[key]:
+                    groups[key].append(it.object_id)
+            else:
+                groups[(it.object_id,)] = [it.object_id]
         out = {}
-        with zipfile.ZipFile(self.path) as zf:
-            lib = MeshLibrary(zf)
-            for object_id in moved:
-                it = first_item[object_id]
-                path = self.build[it.index][1] or "/" + MODEL_PATH
-                tris = lib.triangles(path, object_id, it.transform, parts=self._parts(object_id))
-                if not tris:
-                    continue
-                zs = [v[2] for t in tris for v in t]
-                obj_config = (self.info.get(object_id) or {}).get("config") or {}
-                params = SlicingParams(self.config, obj_config, max(zs) - min(zs))
-                profile = None
-                if adaptive:
-                    profile = adaptive_profile(
-                        tris, params, quality,
-                        parse_height_ranges(ranges_xml, old_index[object_id]))
-                elif old_index[object_id] in existing:
-                    profile = existing[old_index[object_id]]
-                if profile and smooth:
-                    profile = smooth_profile(profile, params, radius, keep_min)
-                if profile:
-                    out[object_id] = profile
+        for members in groups.values():
+            members = [m for m in members if m not in out]
+            if not members:
+                continue
+            if len(members) == 1:
+                prof = base[members[0]]
+                g = geom[members[0]]
+                out[members[0]] = (smooth_profile(prof, g["params"], radius, keep_min)
+                                   if smooth else prof)
+                continue
+            tallest = max(members, key=lambda m: geom[m]["params"].object_height)
+            merged = merge_finest([base[m] for m in members])
+            if smooth:
+                merged = smooth_profile(merged, geom[tallest]["params"], radius, keep_min)
+            for m in members:
+                out[m] = fit_to_height(merged, geom[m]["params"].object_height)
         return out
+
+    def estimate(self):
+        """Estimated print time of the arranged plates, before and after."""
+        geom = self._geometry()
+        model = TimeModel(self.config)
+        samples = {}
+
+        def object_entry(it, cx, cy, profile_key):
+            g = geom[it.object_id]
+            profile = g[profile_key]
+            layers = object_layers(g["params"], profile)
+            key = (it.object_id, profile_key)
+            if key not in samples:
+                if "section" not in g:
+                    g["section"] = CrossSection(g["tris"])
+                samples[key] = g["section"].sample([0.5 * (a + b) for a, b in layers])
+            return (cx, cy, layers, samples[key])
+
+        result = {}
+        for which in ("before", "after"):
+            plates = {}
+            for it in self.items:
+                if not it.moved or it.object_id not in geom:
+                    continue
+                if which == "before":
+                    plate = it.old_plate
+                    cx = (it.bbox[0] + it.bbox[3]) / 2.0
+                    cy = (it.bbox[1] + it.bbox[4]) / 2.0
+                    key = "before"
+                else:
+                    plate = it.plate
+                    cx, cy = it.x + it.width / 2.0, it.y + it.depth / 2.0
+                    geom[it.object_id]["after"] = self.profiles.get(
+                        it.object_id, geom[it.object_id]["before"])
+                    key = "after"
+                plates.setdefault(plate, []).append(object_entry(it, cx, cy, key))
+            seconds = layers = 0
+            for objs in plates.values():
+                t, n = model.plate_time(objs)
+                seconds += t
+                layers += n
+            result[which] = seconds
+            result[which + "_layers"] = layers
+        return result
 
     def _indexed_files(self, new_order):
         """The files keyed by object list place, renumbered for `new_order`."""
@@ -1419,6 +1805,8 @@ class Project:
 
     def arrange(self, settings):
         before = {it.index: it.plate for it in self.items}
+        for it in self.items:
+            it.old_plate = it.plate
         self.new_plate_count = arrange(self.items, self.bed, self.plate_count, settings,
                                        self.config, self.plate_sequences)
         moved = [it for it in self.items if it.moved]
@@ -1540,6 +1928,7 @@ def arrange_file(in_path, out_path, settings, bboxes=None):
         "plates_before": project.plate_count,
         "aligned": align,
         "layer_heights": len(project.profiles),
+        "estimate": project.estimate(),
         "rotated": sum(1 for it in project.items if it.rotated),
         "bed": [bed.x0, bed.y0, bed.x1, bed.y1],
         "changed": sorted(p + 1 for p in project.changed_plates),
@@ -1638,9 +2027,12 @@ select { min-width: 90px; }
     <input type="range" id="radius" min="1" max="10" step="1">
     <output id="radius_out"></output></div>
   <label class="indent"><input type="checkbox" id="keep_min"> Keep min</label>
+  <label><input type="checkbox" id="share"> Same layers for all objects on a plate</label>
+  <div class="note">One profile per plate, with the finest layer any object needs, as in
+    the Variable Layer Height tool with "Each separately" off. Off: each object gets its
+    own layers, which adds plate layers and often print time.</div>
   <div class="note flat">Same as Adaptive and Smooth in the Variable Layer Height tool, for
-    every object that is arranged. Smooth alone smooths each object's current
-    profile.</div>
+    every object that is arranged.</div>
 </fieldset>
 <fieldset><legend>Save To</legend>
   <label><input type="radio" name="output" value="replace"> Project file</label>
@@ -1693,6 +2085,7 @@ function applyState(st) {
   }
   if (s.smooth !== undefined) document.getElementById('smooth').checked = !!s.smooth;
   if (s.smooth_radius !== undefined) document.getElementById('radius').value = s.smooth_radius;
+  if (s.share_layers !== undefined) document.getElementById('share').checked = !!s.share_layers;
   if (s.smooth_keep_min !== undefined) {
     document.getElementById('keep_min').checked = !!s.smooth_keep_min;
   }
@@ -1780,7 +2173,8 @@ function settings() {
     adaptive_quality: Number(document.getElementById('quality').value),
     smooth: document.getElementById('smooth').checked,
     smooth_radius: Number(document.getElementById('radius').value),
-    smooth_keep_min: document.getElementById('keep_min').checked
+    smooth_keep_min: document.getElementById('keep_min').checked,
+    share_layers: document.getElementById('share').checked
   };
 }
 document.getElementById('out').addEventListener('input', function () { outEdited = true; });
@@ -1809,6 +2203,7 @@ pick('plates', 'current');
 pick('output', 'new');
 document.getElementById('quality').value = 0.5;
 document.getElementById('radius').value = 5;
+document.getElementById('share').checked = true;
 updateLayerControls();
 orca.postMessage({type: 'ready'});
 </script></body></html>
@@ -1869,7 +2264,22 @@ def _clean_settings(raw, saved):
         "smooth": bool(raw.get("smooth")),
         "smooth_radius": int(_clamp_number(raw.get("smooth_radius"), 1, 10, 5)),
         "smooth_keep_min": bool(raw.get("smooth_keep_min")),
+        "share_layers": bool(raw.get("share_layers", True)),
     }
+
+
+def estimate_text(est):
+    """One line comparing the estimated print time before and after."""
+    before, after = est["before"], est["after"]
+    if before <= 0:
+        return "Estimated print time: not available."
+    delta = after - before
+    sign = "+" if delta >= 0 else "-"
+    return ("Estimated print time of the arranged plates: %s before, %s after (%s%s, %s%d%%). "
+            "Plate layers: %d before, %d after. Rough estimate: slice to confirm." % (
+                format_duration(before), format_duration(after), sign,
+                format_duration(abs(delta)), sign, round(abs(delta) / before * 100),
+                est["before_layers"], est["after_layers"]))
 
 
 def _count(n, word):
@@ -1916,6 +2326,7 @@ def run_live(raw_settings, out_path, saved):
         text += " Turned %s to the Y axis." % _count(summary["rotated"], "object")
     if summary["layer_heights"]:
         text += " Set layer heights for %s." % _count(summary["layer_heights"], "object")
+    text += "\n" + estimate_text(summary["estimate"])
     if backup:
         text += ("\nReplaced %s (backup: %s).\nTo see the result, open the project again "
                  "with File > Recent Projects. If OrcaSlicer asks to save changes, click "
@@ -2026,6 +2437,8 @@ def main(argv=None):
     parser.add_argument("--smooth", type=int, metavar="RADIUS",
                         help="smooth the layer height profile, radius 1 to 10")
     parser.add_argument("--keep-min", action="store_true", help="smooth: keep min")
+    parser.add_argument("--each-separately", action="store_true",
+                        help="give each object its own layer heights")
     parser.add_argument("--align-y", choices=("auto", "on", "off"), default="auto",
                         help="turn long objects along Y (auto: on for i3 printers)")
     args = parser.parse_args(argv)
@@ -2041,7 +2454,7 @@ def main(argv=None):
                 "adaptive": args.adaptive is not None,
                 "adaptive_quality": args.adaptive if args.adaptive is not None else 0.5,
                 "smooth": args.smooth is not None, "smooth_radius": args.smooth or 5,
-                "smooth_keep_min": args.keep_min}
+                "smooth_keep_min": args.keep_min, "share_layers": not args.each_separately}
     try:
         summary = arrange_file(args.input, out, settings)
     except ArrangeError as err:
@@ -2049,6 +2462,7 @@ def main(argv=None):
         return 1
     print("Arranged %s on %s: %s" % (_count(summary["objects"], "object"),
                                      _count(summary["plates"], "plate"), out))
+    print(estimate_text(summary["estimate"]))
     return 0
 
 

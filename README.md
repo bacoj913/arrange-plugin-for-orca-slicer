@@ -121,13 +121,32 @@ projects with large meshes.
 | Smooth | evens out sudden changes in layer height |
 | Radius | 1 to 10 layers; larger is smoother; default 5 |
 | Keep min | smoothing never makes a layer thicker than before |
+| Same layers for all objects on a plate | one profile per plate (on by default) |
 
 These use the same algorithms as **Adaptive** and **Smooth** in OrcaSlicer's Variable Layer
 Height tool, with the layer height, first layer height, and min / max layer height from your
 printer and process settings (and each object's own layer height, if set). They apply to
 every object that is arranged: on **Current plate only**, the objects on that plate.
-**Smooth** without **Adaptive** smooths each object's current profile; objects without one
-are left as they are. Height range modifiers keep their layer height.
+Height range modifiers keep their layer height.
+
+**Same layers for all objects on a plate** gives every object on the plate one profile,
+with the finest layer any of them needs at each height, as the Variable Layer Height tool
+does with **Each separately** off. OrcaSlicer prints a plate layer by layer: when each
+object has its own profile, their layers fall at different heights, so the plate gets many
+more layers. Each extra layer adds a layer change, and short layers trigger the minimum
+layer time for cooling, which can double the print time of a plate of small parts. Objects
+whose first layer differs (a raft, another first layer height) keep their own profile. With
+the setting off, **Smooth** without **Adaptive** smooths only objects that have a profile.
+
+### Print Time Estimate
+
+After arranging, the result shows an estimated print time of the arranged plates before and
+after, and their number of plate layers. The estimate cuts each object's mesh at every
+layer and adds up walls and infill at the speeds in your settings (capped by the filament's
+maximum volumetric speed), travel between objects, retractions, layer changes and the
+minimum layer time. It leaves out acceleration, supports, bridges and the purge, so the
+absolute times are lower than OrcaSlicer's; use it to compare before and after, and slice
+to confirm.
 
 To check the result, select an object and open the Variable Layer Height tool after
 opening the project again.
@@ -159,7 +178,7 @@ python arrange_by_height.py project.3mf
 ```
 
 ```bash
-python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --plates current --plate 2 --align-y on --adaptive 0.35 --smooth 5
+python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --plates current --plate 2 --align-y on --adaptive 0.35 --smooth 5 --each-separately
 ```
 
 From the command line the plugin reads the object geometry from the 3MF, which is slower for
