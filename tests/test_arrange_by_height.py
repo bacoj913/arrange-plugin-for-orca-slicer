@@ -120,7 +120,7 @@ class Base(unittest.TestCase):
 
     def run_arrange(self, objects, settings=None, **kw):
         make_project(self.src, objects, **kw)
-        s = dict(abh.DEFAULT_SETTINGS)
+        s = dict(abh.DEFAULT_SETTINGS, plates="keep")
         s.update(settings or {})
         summary = abh.arrange_file(self.src, self.out, s)
         project, plate_xml = read_result(self.out)
@@ -241,7 +241,7 @@ class LayoutTest(Base):
         with zipfile.ZipFile(self.src, "w") as zf:
             for n, data in files.items():
                 zf.writestr(n, data)
-        abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS))
+        abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS, plates="keep"))
         project, plate_xml = read_result(self.out)
         self.assert_valid(project, 40)
         self.assertIn('key="print_sequence" value="by object"', plate_xml)
@@ -296,17 +296,19 @@ class PlateTest(Base):
     def test_object_too_large(self):
         make_project(self.src, [(250, 20, 10, [translate(100, 100)])])
         with self.assertRaises(abh.ArrangeError):
-            abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS))
+            abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS, plates="keep"))
 
     def test_live_bboxes_used(self):
         make_project(self.src, [(20, 20, 10, [translate(50, 50)]),
                                 (20, 20, 30, [translate(100, 50)])])
         boxes = [(40, 40, 0, 60, 60, 10), (90, 40, 0, 110, 60, 30)]
-        abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS), boxes)
+        abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS, plates="keep"),
+                         boxes)
         project, _ = read_result(self.out)
         self.assert_valid(project, abh.MIN_AUTO_GAP)
         with self.assertRaises(abh.ArrangeError):
-            abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS), boxes[:1])
+            abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS, plates="keep"),
+                             boxes[:1])
 
     def test_other_files_copied(self):
         self.run_arrange([(20, 20, 10, [translate(50, 50)])])
@@ -391,8 +393,93 @@ class AlignTest(Base):
     def test_summary_layout(self):
         summary, _, _ = self.run_arrange(self.long_parts(), {"align_y": "on"})
         self.assertEqual(summary["bed"], [0, 0, 200, 200])
-        names = sorted(o["name"] for o in summary["layout"][0])
+        self.assertEqual(summary["layout"][0]["plate"], 1)
+        names = sorted(o["name"] for o in summary["layout"][0]["objects"])
         self.assertEqual(names, ["Part 1", "Part 2", "Part 3", "Part 4"])
+
+
+class RowsTest(Base):
+    def test_rows_along_x(self):
+        heights = [10, 90, 20, 80, 30, 70, 40, 60, 50, 15, 25, 35]
+        objects = [(20, 20, h, [translate(15 + 15 * i, 15)]) for i, h in enumerate(heights)]
+        _, project, _ = self.run_arrange(objects, {"layout": "rows", "spacing": "5"},
+                                         config={"printable_area": ["0x0", "130x0",
+                                                                    "130x200", "0x200"]})
+        self.assert_valid(project, 5)
+        rows = {}
+        for it in project.items:
+            rows.setdefault(round(it.bbox[1], 3), []).append(it)
+        self.assertEqual(sorted(len(r) for r in rows.values()), [2, 5, 5])
+        # The tallest row is in the middle, and the tallest object in the middle of it.
+        ys = sorted(rows)
+        middle = rows[ys[1]]
+        self.assertEqual(max(i.height for i in middle), 90)
+        middle.sort(key=lambda i: i.bbox[0])
+        self.assertEqual(round(middle[2].height), 90)
+        self.assertAlmostEqual((middle[2].bbox[0] + middle[2].bbox[3]) / 2, 65)
+
+    def test_rows_overflow(self):
+        objects = [(90, 90, 10 + i, [translate(50, 50)]) for i in range(6)]
+        summary, project, _ = self.run_arrange(objects, {"layout": "rows", "spacing": "5"})
+        self.assertEqual(summary["plates"], 2)
+        self.assert_valid(project, 5)
+
+
+class CurrentPlateTest(Base):
+    def objects(self):
+        stride = 240
+        return [(20, 20, 10, [translate(30, 30)]), (20, 20, 40, [translate(170, 170)]),
+                (20, 20, 25, [translate(30 + stride, 30)]),
+                (20, 20, 50, [translate(170 + stride, 170)]),
+                (60, 12, 5, [translate(100 + stride, 100)])]
+
+    def test_only_current_plate_moves(self):
+        plates = [[(0, 0), (1, 0)], [(2, 0), (3, 0), (4, 0)]]
+        make_project(self.src, self.objects(), plates=plates,
+                     config={"printer_structure": "i3"})
+        before = abh.Project(self.src)
+        before.load_bboxes()
+        summary = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="current", plate_index=1, spacing="4"))
+        project, plate_xml = read_result(self.out)
+        self.assertEqual(summary["plates"], 2)
+        self.assertEqual(summary["changed"], [2])
+        self.assertEqual([p["plate"] for p in summary["layout"]], [2])
+        old = {it.object_id: it.bbox for it in before.items}
+        for it in project.items:
+            if it.object_id in ("2", "3"):
+                # Plate 1: untouched, same place, same list position.
+                for a, b in zip(it.bbox, old[it.object_id]):
+                    self.assertAlmostEqual(a, b, places=6)
+        self.assertEqual([it.object_id for it in project.items][:2], ["2", "3"])
+        # Plate 2: shortest first in the list, the long part turned along Y.
+        self.assertEqual([it.object_id for it in project.items][2:], ["6", "4", "5"])
+        turned = [it for it in project.items if it.object_id == "6"][0]
+        self.assertAlmostEqual(turned.depth, 60, places=6)
+        self.assertEqual(summary["rotated"], 1)
+        self.assert_valid(project, 4)
+        # Plate 1 keeps its thumbnail; plate 2 loses it.
+        self.assertIn("Metadata/plate_1.png", plate_xml)
+        self.assertNotIn("Metadata/plate_2.png", plate_xml)
+
+    def test_current_plate_overflow(self):
+        objects = [(20, 20, 10, [translate(30, 30)])] + [
+            (90, 90, 10 + i, [translate(50 + 240, 50)]) for i in range(6)]
+        plates = [[(0, 0)], [(i, 0) for i in range(1, 7)]]
+        make_project(self.src, objects, plates=plates)
+        summary = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="current", plate_index=1, spacing="5"))
+        self.assertEqual(summary["plates"], 3)
+        self.assertEqual(summary["changed"], [1, 2, 3])
+        project, _ = read_result(self.out)
+        self.assert_valid(project, 5)
+        self.assertEqual(sum(1 for it in project.items if it.plate == 0), 1)
+
+    def test_empty_or_missing_plate(self):
+        make_project(self.src, self.objects()[:2])
+        with self.assertRaises(abh.ArrangeError):
+            abh.arrange_file(self.src, self.out, dict(
+                abh.DEFAULT_SETTINGS, plates="current", plate_index=3))
 
 
 class FakeOrca:
@@ -443,6 +530,9 @@ class FakeOrca:
             def object_count(self):
                 return len(test.boxes)
 
+            def current_plate_index(self):
+                return test.plate
+
         class Plater:
             def project_path(self):
                 return project_path
@@ -466,8 +556,10 @@ class FakeOrca:
         m.registered = []
         m.register_capability = m.registered.append
         m.LifecycleEvent = types.SimpleNamespace(ProjectOpened=1, NewProject=2,
-                                                 ProjectAfterSave=3, PresetSelected=4)
+                                                 ProjectAfterSave=3, PresetSelected=4,
+                                                 PlateSelected=5)
         self.boxes = []
+        self.plate = 0
 
 
 class PluginTest(Base):
@@ -496,12 +588,14 @@ class PluginTest(Base):
         page = mod.ArrangeByHeightPage()
         self.assertIn("Arrange by Height", page.get_ui())
         self.assertTrue(page.get_icon().endswith(".svg"))
+        self.assertEqual(page.get_name(), "Arrange")
 
         page.on_message(json.dumps({"type": "ready"}))
         state = page.sent[-1]
         self.assertEqual(state["type"], "state")
         self.assertEqual(state["out"], os.path.join(self.tmp.name, "brackets-arranged.3mf"))
         self.assertTrue(state["bedslinger"])
+        self.assertEqual(state["plate"], 1)
 
         page.on_message({"type": "arrange", "out": state["out"],
                          "settings": {"spacing": "5", "layout": "grid", "plates": "keep",
@@ -512,6 +606,22 @@ class PluginTest(Base):
         self.assertTrue(os.path.exists(state["out"]))
         self.assertFalse(os.path.exists(os.path.join(self.tmp.name, "export.3mf")))
         self.assertEqual(json.loads(page.config)["layout"], "grid")
+
+        # Replace the project file: a backup is kept.
+        import shutil
+        shutil.copy(self.src, project_path)
+        page.on_message({"type": "arrange", "out": "",
+                         "settings": {"output": "replace", "plates": "current",
+                                      "layout": "rows"}})
+        result = page.sent[-1]
+        self.assertTrue(result["ok"], result["text"])
+        self.assertIn("Don't Save", result["text"])
+        backup = os.path.join(self.tmp.name, "brackets-backup.3mf")
+        with open(backup, "rb") as a, open(self.src, "rb") as b:
+            self.assertEqual(a.read(), b.read())
+        with zipfile.ZipFile(project_path) as zf:
+            self.assertIn(abh.MODEL_PATH, zf.namelist())
+        self.assertNotEqual(open(project_path, "rb").read(), open(self.src, "rb").read())
 
         page.on_message({"type": "arrange", "out": "bad.txt", "settings": {}})
         self.assertFalse(page.sent[-1]["ok"])
@@ -524,7 +634,8 @@ class CommandLineTest(Base):
     def test_main(self):
         make_project(self.src, [(20, 20, 10, [translate(50, 50)])])
         self.assertEqual(abh.main([self.src, "-o", self.out, "--spacing", "3",
-                                   "--align-y", "on"]), 0)
+                                   "--align-y", "on", "--layout", "rows",
+                                   "--plates", "current", "--plate", "1"]), 0)
         self.assertTrue(os.path.exists(self.out))
 
 

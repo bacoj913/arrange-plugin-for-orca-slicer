@@ -4,19 +4,24 @@
 #
 # [tool.orcaslicer.plugin]
 # name = "Arrange by Height"
-# description = "Arranges each plate with the tallest objects in the center and writes a new 3MF."
+# description = "Arranges plates by object height, tallest in the middle. Adds an Arrange tab."
 # author = "bacoj913"
-# version = "1.0.0"
+# version = "1.1.0"
 # ///
 """Arrange by Height: an OrcaSlicer plugin and command-line tool.
 
 The OrcaSlicer plugin API is read-only, so the plugin cannot move objects in the open
-project. It exports a copy of the project, arranges that copy and writes a new 3MF file.
-Open the new file with File > Open Project.
+project. It exports a copy of the project, arranges that copy and writes it to a new 3MF
+file or over the saved project file (keeping a backup). Open the file again to see it.
 
 Layout rules:
-- Each plate is laid out from the center out. The tallest object goes in the center and
-  shorter objects go around it, so upper layers only visit the center of the plate.
+- Compact: the tallest object goes in the center of the plate and shorter objects go
+  around it, so upper layers only visit the center of the plate.
+- Rows: rows along X, tallest row in the middle and the tallest object in the middle of
+  each row. On a bedslinger the bed moves in Y, so rows along X keep bed moves short.
+- Grid: equal cells, tallest objects in the center cells.
+- Only the selected plate, or every plate, is arranged. Objects that no longer fit go to
+  new plates at the end.
 - The object list is set per plate from shortest to tallest. With print sequence
   "By object", OrcaSlicer prints in object list order, so tall objects print last.
 - Spacing is a fixed value in mm, or Auto: OrcaSlicer's own arrange spacing for the plate's
@@ -26,7 +31,8 @@ Layout rules:
 
 Command line (no OrcaSlicer needed):
     python arrange_by_height.py project.3mf [-o out.3mf] [--spacing auto|MM]
-        [--layout compact|grid] [--plates keep|regroup] [--align-y auto|on|off]
+        [--layout compact|rows|grid] [--plates all|regroup|current] [--plate N]
+        [--align-y auto|on|off]
 """
 
 import argparse
@@ -34,6 +40,7 @@ import json
 import math
 import os
 import re
+import shutil
 import sys
 import zipfile
 import xml.etree.ElementTree as ET
@@ -55,8 +62,9 @@ MAX_OUTER_NOZZLE_DIAMETER = 4.0
 MAX_PLATE_COUNT = 36
 DEFAULT_SETTINGS = {
     "spacing": "auto",       # "auto" or a number in mm
-    "layout": "compact",     # "compact" or "grid"
-    "plates": "keep",        # "keep" or "regroup"
+    "layout": "compact",     # "compact", "rows" or "grid"
+    "plates": "current",     # "current" (the plate in plate_index), "keep" or "regroup"
+    "output": "new",         # "new" file or "replace" the project file
     "align_y": "auto",       # "auto", "on" or "off"
 }
 MIN_AUTO_GAP = 2.0           # mm, used for "By layer" when there is no brim
@@ -93,6 +101,7 @@ class Item:
         self.transform = None                 # 3MF item transform, 3x4 rows
         self.identify_id = None
         self.rotated = 0.0                    # radians turned about Z by Align to Y axis
+        self.moved = False                    # placed by this run
         self.old_origin = (0.0, 0.0)          # world origin of the plate the item was on
 
     @property
@@ -495,6 +504,66 @@ def _layout_bounded(items, bed, gap, margin):
     return rejected
 
 
+def _center_out(seq):
+    """Reorder a tallest-first list so the first is in the middle, then right, left, ..."""
+    out = []
+    for k, it in enumerate(seq):
+        if k % 2:
+            out.append(it)
+        else:
+            out.insert(0, it)
+    return out
+
+
+def layout_rows(items, bed, gap, margin):
+    """Place items in rows along X, tallest row in the middle of the bed.
+
+    Rows run side to side, so on a bedslinger (bed moving in Y) the bed moves little
+    while the nozzle prints along a row. Each row has its tallest item in the middle.
+    Returns the items that did not fit.
+    """
+    room_w = bed.x1 - bed.x0 - 2 * margin
+    room_d = bed.y1 - bed.y0 - 2 * margin
+    order = sorted(items, key=lambda i: (-i.height, i.index))
+    rows, row, width = [], [], 0.0
+    for it in order:
+        need = it.width if not row else width + gap + it.width
+        if row and need > room_w + EPS:
+            rows.append(row)
+            row, need = [], it.width
+        row.append(it)
+        width = need
+    if row:
+        rows.append(row)
+    # Drop the shortest rows until the rows fit the bed's depth.
+    rejected = []
+    while rows and (sum(max(i.depth for i in r) for r in rows)
+                    + gap * (len(rows) - 1)) > room_d + EPS:
+        rejected.extend(rows.pop())
+    # Tallest row in the middle, then behind, in front, ...
+    rows = _center_out(rows)
+    y = 0.0
+    for r in rows:
+        row_d = max(i.depth for i in r)
+        x = 0.0
+        for it in _center_out(r):
+            it.x = x
+            it.y = y + (row_d - it.depth) / 2.0
+            x += it.width + gap
+        # Center the row on X = 0.
+        shift = -(x - gap) / 2.0
+        for it in r:
+            it.x += shift
+        y += row_d + gap
+    done = [i for r in rows for i in r]
+    if done:
+        box = (min(i.x for i in done), min(i.y for i in done),
+               max(i.x + i.width for i in done), max(i.y + i.depth for i in done))
+        if not _fit_cluster(done, box, bed, margin):
+            return _layout_bounded(items, bed, gap, margin)
+    return rejected
+
+
 def layout_grid(items, bed, gap, margin):
     """Place items on a grid of equal cells; the tallest items take the center cells.
 
@@ -550,7 +619,8 @@ def layout_grid(items, bed, gap, margin):
 
 def arrange(items, bed, plate_count, settings, config, plate_sequences=None):
     """Assign items to plates and place them. Returns the new plate count."""
-    layout = layout_grid if settings.get("layout") == "grid" else layout_compact
+    layouts = {"grid": layout_grid, "rows": layout_rows}
+    layout = layouts.get(settings.get("layout"), layout_compact)
     margin = edge_margin(config)
     plate_sequences = plate_sequences or {}
     global_sequence = _str(config.get("print_sequence"), "by layer")
@@ -593,9 +663,35 @@ def arrange(items, bed, plate_count, settings, config, plate_sequences=None):
             queue = queue[lo:]
 
     plates = []
-    if settings.get("plates") == "regroup":
+    if settings.get("plates") == "current":
+        target = int(settings.get("plate_index", 0))
+        count = max([plate_count] + [it.plate + 1 for it in items])
+        if not 0 <= target < count:
+            raise ArrangeError("Plate %d does not exist." % (target + 1))
+        groups = {}
+        for it in items:
+            groups.setdefault(it.plate, []).append(it)
+        plates = [groups.get(p, []) for p in range(count)]
+        for it in items:
+            if it.plate != target:
+                it.x, it.y = it.bbox[0], it.bbox[1]      # other plates stay as they are
+        chosen = plates[target]
+        if not chosen:
+            raise ArrangeError("Plate %d is empty." % (target + 1))
+        for it in chosen:
+            it.moved = True
+        overflow = layout(chosen, bed, gap_for(target, chosen), margin)
+        for it in overflow:
+            chosen.remove(it)
+        # Objects that do not fit go to new plates at the end.
+        fill_plates(overflow, plates)
+    elif settings.get("plates") == "regroup":
+        for it in items:
+            it.moved = True
         fill_plates(items, plates)
     else:
+        for it in items:
+            it.moved = True
         groups = {}
         for it in items:
             groups.setdefault(it.plate, []).append(it)
@@ -618,8 +714,20 @@ def object_order(items):
     """Object ids in the new object list order.
 
     By plate, then shortest to tallest. Objects of equal height are ordered in rows
-    (back to front, alternating direction) to keep travel short.
+    (back to front, alternating direction) to keep travel short. Objects this run did not
+    move keep their place in the list; the moved objects are sorted into the places the
+    moved objects had.
     """
+    original = []
+    for it in sorted(items, key=lambda i: i.index):
+        if it.object_id not in original:
+            original.append(it.object_id)
+    moved = set(it.object_id for it in items if it.moved)
+    sorted_moved = iter(_sorted_objects([it for it in items if it.object_id in moved]))
+    return [next(sorted_moved) if oid in moved else oid for oid in original]
+
+
+def _sorted_objects(items):
     first = {}
     for it in items:
         key = (it.plate, round(it.height, 1))
@@ -861,13 +969,14 @@ class Project:
             it.plate, it.identify_id = mapping.get((object_id, inst), (-1, None))
             self.items.append(it)
 
-    def load_bboxes(self, bboxes=None, align_y=False):
+    def load_bboxes(self, bboxes=None, align_y=False, only_plate=None):
         """Set each item's world bounding box, from `bboxes` or from the meshes.
 
-        With `align_y`, long objects are first turned so their long side runs along Y.
+        With `align_y`, long objects are first turned so their long side runs along Y
+        (only those on `only_plate` when it is given).
         """
         if align_y:
-            self._align_y()
+            self._align_y(only_plate)
         elif bboxes is not None:
             if len(bboxes) != len(self.items):
                 raise ArrangeError("Object count does not match the exported project.")
@@ -882,7 +991,8 @@ class Project:
                         raise ArrangeError("Object %s has no geometry." % object_id)
         self._to_plate_coordinates()
 
-    def _align_y(self):
+    def _align_y(self, only_plate=None):
+        cols = plate_columns(self.plate_count)
         with zipfile.ZipFile(self.path) as zf:
             lib = MeshLibrary(zf)
             for it, (object_id, path, _t) in zip(self.items, self.build):
@@ -892,7 +1002,11 @@ class Project:
                 hull, z0, z1 = fp
                 xs, ys = zip(*hull)
                 pivot = ((min(xs) + max(xs)) / 2.0, (min(ys) + max(ys)) / 2.0)
-                angle = y_align_angle(hull)
+                if it.plate < 0:
+                    p = plate_of_point(pivot[0], pivot[1], cols, self.bed)
+                    it.plate = p if p is not None and p < self.plate_count else 0
+                skip = only_plate is not None and it.plate != only_plate
+                angle = 0.0 if skip else y_align_angle(hull)
                 if angle:
                     it.transform = rotate_z(it.transform, angle, pivot)
                     it.rotated = angle
@@ -915,8 +1029,14 @@ class Project:
             it.bbox = (b[0] - ox, b[1] - oy, b[2], b[3] - ox, b[4] - oy, b[5])
 
     def arrange(self, settings):
+        before = {it.index: it.plate for it in self.items}
         self.new_plate_count = arrange(self.items, self.bed, self.plate_count, settings,
                                        self.config, self.plate_sequences)
+        moved = [it for it in self.items if it.moved]
+        self.changed_plates = set(it.plate for it in moved) | set(before[it.index] for it in moved)
+        if self.new_plate_count != self.plate_count:
+            # The plate grid changes, so OrcaSlicer moves every plate: redo all thumbnails.
+            self.changed_plates = set(range(self.new_plate_count))
 
     def write(self, out_path):
         cols = plate_columns(self.new_plate_count)
@@ -975,8 +1095,10 @@ class Project:
                 text = templates[plate]
                 text = re.sub(r"[ \t]*<model_instance>.*?</model_instance>\s*", "", text,
                               flags=re.S)
-                for key in STALE_PLATE_KEYS:
-                    text = re.sub(r'[ \t]*<metadata key="%s" value="[^"]*"\s*/>\s*' % key, "", text)
+                if plate in self.changed_plates:
+                    for key in STALE_PLATE_KEYS:
+                        text = re.sub(r'[ \t]*<metadata key="%s" value="[^"]*"\s*/>\s*' % key,
+                                      "", text)
                 text = re.sub(r'(<metadata key="plater_id" value=")[^"]*(")',
                               r"\g<1>%d\g<2>" % (plate + 1), text)
             else:
@@ -1012,7 +1134,8 @@ def arrange_file(in_path, out_path, settings, bboxes=None):
     """Arrange `in_path` and write `out_path`. Returns a short summary."""
     project = Project(in_path)
     align = align_enabled(settings, project.config)
-    project.load_bboxes(bboxes, align_y=align)
+    only = int(settings.get("plate_index", 0)) if settings.get("plates") == "current" else None
+    project.load_bboxes(bboxes, align_y=align, only_plate=only)
     project.arrange(settings)
     project.write(out_path)
     bed = project.bed
@@ -1023,12 +1146,14 @@ def arrange_file(in_path, out_path, settings, bboxes=None):
         "aligned": align,
         "rotated": sum(1 for it in project.items if it.rotated),
         "bed": [bed.x0, bed.y0, bed.x1, bed.y1],
+        "changed": sorted(p + 1 for p in project.changed_plates),
         "layout": [
-            [{"name": project.names.get(it.object_id) or "Object %s" % it.object_id,
-              "x": round(it.x, 2), "y": round(it.y, 2),
-              "w": round(it.width, 2), "d": round(it.depth, 2), "h": round(it.height, 2)}
-             for it in project.items if it.plate == p]
-            for p in range(project.new_plate_count)],
+            {"plate": p + 1, "objects": [
+                {"name": project.names.get(it.object_id) or "Object %s" % it.object_id,
+                 "x": round(it.x, 2), "y": round(it.y, 2), "w": round(it.width, 2),
+                 "d": round(it.depth, 2), "h": round(it.height, 2)}
+                for it in project.items if it.plate == p]}
+            for p in sorted(set(it.plate for it in project.items if it.moved))],
     }
 
 
@@ -1078,12 +1203,19 @@ select { min-width: 90px; }
 <fieldset><legend>Layout</legend>
   <label><input type="radio" name="layout" value="compact"> Compact</label>
   <div class="note">Tallest object in the center, shorter objects packed around it.</div>
+  <label><input type="radio" name="layout" value="rows"> Rows</label>
+  <div class="note">Rows along X, tallest row in the middle. Best for bedslingers:
+    the bed moves less.</div>
   <label><input type="radio" name="layout" value="grid"> Grid</label>
   <div class="note">Equal cells, tallest objects in the center cells. Best for similar parts.</div>
 </fieldset>
 <fieldset><legend>Plates</legend>
-  <label><input type="radio" name="plates" value="keep"> Keep objects on their plates</label>
-  <label><input type="radio" name="plates" value="regroup"> Regroup plates by height</label>
+  <label><input type="radio" name="plates" value="current"> Current plate only</label>
+  <div class="note">Other plates are not changed. <span id="plateinfo"></span></div>
+  <label><input type="radio" name="plates" value="keep"> All plates, objects stay on their
+    plate</label>
+  <label><input type="radio" name="plates" value="regroup"> All plates, regroup by
+    height</label>
   <div class="note">Tallest objects on plate 1. Objects of similar height share a plate.</div>
 </fieldset>
 <fieldset><legend>Align to Y Axis</legend>
@@ -1093,9 +1225,14 @@ select { min-width: 90px; }
     Auto: on for bedslinger printers (printer structure i3).
     <span id="printer"></span></div>
 </fieldset>
-<fieldset><legend>Output File</legend>
+<fieldset><legend>Save To</legend>
+  <label><input type="radio" name="output" value="replace"> Project file</label>
+  <div class="note">Replaces the saved project. A backup is kept as
+    &lt;project&gt;-backup.3mf.</div>
+  <label><input type="radio" name="output" value="new"> New file</label>
   <input type="text" id="out">
-  <div class="note flat">Open it with File &gt; Open Project after arranging.</div>
+  <div class="note flat">The open project is not updated: open the file again
+    after arranging.</div>
 </fieldset>
 <button id="arrange">Arrange</button>
 </div>
@@ -1132,6 +1269,10 @@ function applyState(st) {
   if (s.layout) pick('layout', s.layout);
   if (s.plates) pick('plates', s.plates);
   if (s.align_y) document.getElementById('align').value = s.align_y;
+  if (s.output) pick('output', s.output);
+  if (st.plate !== undefined) {
+    document.getElementById('plateinfo').textContent = 'Selected: plate ' + st.plate + '.';
+  }
   if (st.out && !outEdited) document.getElementById('out').value = st.out;
   if (st.printer !== undefined) {
     document.getElementById('printer').textContent = st.printer
@@ -1155,8 +1296,11 @@ function drawPlates(sum) {
   if (!sum || !sum.layout) return;
   const b = sum.bed, w = b[2] - b[0], d = b[3] - b[1];
   let hmax = 0;
-  sum.layout.forEach(function (pl) { pl.forEach(function (o) { hmax = Math.max(hmax, o.h); }); });
-  sum.layout.forEach(function (pl, i) {
+  sum.layout.forEach(function (pl) {
+    pl.objects.forEach(function (o) { hmax = Math.max(hmax, o.h); });
+  });
+  sum.layout.forEach(function (entry) {
+    const pl = entry.objects;
     let svg = '<svg viewBox="' + (b[0] - 2) + ' ' + (-b[3] - 2) + ' ' + (w + 4) + ' ' +
       (d + 4) + '">';
     svg += '<rect class="bed" x="' + b[0] + '" y="' + (-b[3]) + '" width="' + w +
@@ -1175,7 +1319,7 @@ function drawPlates(sum) {
     svg += '</svg>';
     const div = document.createElement('div');
     div.className = 'plate';
-    div.innerHTML = '<h3>Plate ' + (i + 1) + ' (' + pl.length + ')</h3>' + svg;
+    div.innerHTML = '<h3>Plate ' + entry.plate + ' (' + pl.length + ')</h3>' + svg;
     box.appendChild(div);
   });
   document.getElementById('legend').hidden = false;
@@ -1187,7 +1331,8 @@ function settings() {
     manual_gap: document.getElementById('gap').value,
     layout: value('layout'),
     plates: value('plates'),
-    align_y: document.getElementById('align').value
+    align_y: document.getElementById('align').value,
+    output: value('output')
   };
 }
 document.getElementById('out').addEventListener('input', function () { outEdited = true; });
@@ -1212,7 +1357,8 @@ orca.onMessage(function (msg) {
 });
 pick('spacing', 'auto');
 pick('layout', 'compact');
-pick('plates', 'keep');
+pick('plates', 'current');
+pick('output', 'new');
 orca.postMessage({type: 'ready'});
 </script></body></html>
 """
@@ -1254,8 +1400,11 @@ def _clean_settings(raw, saved):
     return {
         "spacing": spacing,
         "manual_gap": str(raw.get("manual_gap") or saved.get("manual_gap") or "6"),
-        "layout": raw.get("layout") if raw.get("layout") in ("compact", "grid") else "compact",
-        "plates": raw.get("plates") if raw.get("plates") in ("keep", "regroup") else "keep",
+        "layout": (raw.get("layout") if raw.get("layout") in ("compact", "rows", "grid")
+                   else "compact"),
+        "plates": (raw.get("plates") if raw.get("plates") in ("current", "keep", "regroup")
+                   else "current"),
+        "output": raw.get("output") if raw.get("output") in ("new", "replace") else "new",
         "align_y": raw.get("align_y") if raw.get("align_y") in ("auto", "on", "off") else "auto",
     }
 
@@ -1268,19 +1417,29 @@ def run_live(raw_settings, out_path, saved):
     """Arrange the open project. Returns (ok, text, summary, settings)."""
     try:
         settings = _clean_settings(raw_settings, saved)
+        plater = orca.host.plater()
+        model = orca.host.model()
+        if model.object_count() == 0:
+            raise ArrangeError("The project has no objects.")
+        backup = None
+        if settings["output"] == "replace":
+            out_path = plater.project_path()
+            if not out_path:
+                raise ArrangeError("Save the project first, or choose New file.")
+            backup = os.path.splitext(out_path)[0] + "-backup.3mf"
         out_path = (out_path or "").strip()
         if not out_path.lower().endswith(".3mf"):
             raise ArrangeError("The output file must end in .3mf.")
-        plater = orca.host.plater()
-        if orca.host.model().object_count() == 0:
-            raise ArrangeError("The project has no objects.")
+        run = dict(settings, plate_index=model.current_plate_index())
         storage = orca.host.plugin.storage()
         export_path = os.path.join(storage, "export.3mf")
         try:
             plater.export_3mf_copy(export_path)
+            if backup and os.path.exists(out_path):
+                shutil.copy2(out_path, backup)
             # Sizes from the live model are exact and fast; the exported build lists the
             # instances in the same order. Align to Y axis reads the meshes instead.
-            summary = arrange_file(export_path, out_path, settings, _live_bboxes())
+            summary = arrange_file(export_path, out_path, run, _live_bboxes())
         finally:
             try:
                 os.remove(export_path)
@@ -1292,7 +1451,12 @@ def run_live(raw_settings, out_path, saved):
                                    _count(summary["plates"], "plate"))
     if summary["aligned"]:
         text += " Turned %s to the Y axis." % _count(summary["rotated"], "object")
-    text += "\nSaved to %s\nOpen it with File > Open Project." % out_path
+    if backup:
+        text += ("\nReplaced %s (backup: %s).\nTo see the result, open the project again "
+                 "with File > Recent Projects. If OrcaSlicer asks to save changes, click "
+                 "Don't Save, or the result is overwritten." % (out_path, os.path.basename(backup)))
+    else:
+        text += "\nSaved to %s\nOpen it with File > Open Project." % out_path
     return True, text, summary, settings
 
 
@@ -1302,7 +1466,7 @@ if orca is not None:
         """The Arrange by Height tab in the main window."""
 
         def get_name(self):
-            return "Arrange by Height"
+            return "Arrange"
 
         def get_icon(self):
             try:
@@ -1337,6 +1501,10 @@ if orca is not None:
             except Exception:
                 pass
             try:
+                state["plate"] = orca.host.model().current_plate_index() + 1
+            except Exception:
+                pass
+            try:
                 structure = orca.host.preset_bundle().full_config_value("printer_structure")
                 state["printer"] = bool(structure)
                 state["bedslinger"] = _str(structure) == "i3"
@@ -1361,7 +1529,8 @@ if orca is not None:
         def on_lifecycle_event(self, event, ctx):
             if event in (orca.LifecycleEvent.ProjectOpened, orca.LifecycleEvent.NewProject,
                          orca.LifecycleEvent.ProjectAfterSave,
-                         orca.LifecycleEvent.PresetSelected):
+                         orca.LifecycleEvent.PresetSelected,
+                         orca.LifecycleEvent.PlateSelected):
                 try:
                     self._push_state()
                 except Exception:
@@ -1382,8 +1551,11 @@ def main(argv=None):
     parser.add_argument("input", help="OrcaSlicer 3MF project")
     parser.add_argument("-o", "--output", help="output file (default: <input>-arranged.3mf)")
     parser.add_argument("--spacing", default="auto", help='gap between objects in mm, or "auto"')
-    parser.add_argument("--layout", choices=("compact", "grid"), default="compact")
-    parser.add_argument("--plates", choices=("keep", "regroup"), default="keep")
+    parser.add_argument("--layout", choices=("compact", "rows", "grid"), default="compact")
+    parser.add_argument("--plates", choices=("all", "regroup", "current"), default="all",
+                        help="all: every plate, objects stay on their plate; "
+                             "current: only the plate given with --plate")
+    parser.add_argument("--plate", type=int, default=1, help="plate number for --plates current")
     parser.add_argument("--align-y", choices=("auto", "on", "off"), default="auto",
                         help="turn long objects along Y (auto: on for i3 printers)")
     args = parser.parse_args(argv)
@@ -1393,8 +1565,9 @@ def main(argv=None):
         except ValueError:
             parser.error('--spacing must be a number or "auto"')
     out = args.output or os.path.splitext(args.input)[0] + "-arranged.3mf"
-    settings = {"spacing": args.spacing, "layout": args.layout, "plates": args.plates,
-                "align_y": args.align_y}
+    settings = {"spacing": args.spacing, "layout": args.layout,
+                "plates": "keep" if args.plates == "all" else args.plates,
+                "plate_index": args.plate - 1, "align_y": args.align_y}
     try:
         summary = arrange_file(args.input, out, settings)
     except ArrangeError as err:

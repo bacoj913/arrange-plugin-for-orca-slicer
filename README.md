@@ -1,7 +1,7 @@
 # Arrange by Height for OrcaSlicer
 
-An OrcaSlicer plugin that arranges each build plate by object height. It adds an
-**Arrange by Height** tab to the top bar, next to Prepare and Preview.
+An OrcaSlicer plugin that arranges build plates by object height. It adds an **Arrange**
+tab to the top bar, next to Prepare and Preview.
 
 ![The Arrange by Height tab](docs/tab-preview.png)
 
@@ -12,10 +12,12 @@ An OrcaSlicer plugin that arranges each build plate by object height. It adds an
 - **Object list from shortest to tallest**, per plate. With print sequence **By object**,
   OrcaSlicer prints in object list order, so tall objects print last.
 - **Spacing**: Auto, or a fixed distance in mm.
-- **Layout**: Compact (packed around the tallest object) or Grid (equal cells, tallest objects
-  in the center cells).
-- **Plates**: keep each object on its plate, or regroup all objects so objects of similar
-  height share a plate.
+- **Layout**: Compact (packed around the tallest object), Rows (rows along X, tallest row
+  in the middle; best for bedslingers) or Grid (equal cells, tallest objects in the center
+  cells).
+- **Plates**: the selected plate only, every plate with objects kept on their plate, or
+  every plate regrouped so objects of similar height share a plate.
+- **Save to** the project file (a backup is kept) or a new file.
 - **Align to Y axis**: turns long objects so their long side runs along Y, for bedslinger
   printers such as the Bambu Lab A1. Auto turns it on when the printer structure is i3, as
   OrcaSlicer's own arrange does.
@@ -30,9 +32,9 @@ plugin therefore:
 
 1. Exports a copy of the open project, unsaved changes included.
 2. Arranges the copy.
-3. Writes a new project file, `<project>-arranged.3mf` by default.
+3. Writes it over the project file, or to a new file.
 
-Open the new file with **File > Open Project**. The original project is not changed.
+The open window is not updated. Open the file again to see the result.
 
 ## Requirements
 
@@ -58,10 +60,15 @@ OrcaSlicer data folder:
 
 ## Use
 
-1. Click the **Arrange by Height** tab in the top bar.
-2. Choose the settings and the output file, then click **Arrange**.
-3. On the first run, OrcaSlicer asks to allow the plugin to write files. Allow it.
-4. Check the preview, then open the output file with **File > Open Project**.
+1. In **Prepare**, select the plate to arrange.
+2. Click the **Arrange** tab in the top bar.
+3. Choose the settings, then click **Arrange**.
+4. On the first run, OrcaSlicer asks to allow the plugin to write files. Allow it.
+5. Check the preview, then open the project again:
+   - **Save to: Project file**: **File > Recent Projects**, then your project. If
+     OrcaSlicer asks to save changes, click **Don't Save**. Saving would write the old
+     arrangement back over the new one.
+   - **Save to: New file**: **File > Open Project**, then `<project>-arranged.3mf`.
 
 The settings are saved for the next run. If the tab is not shown, check **Preferences >
 General > Plugins > Visible plugin pages**: further plugin tabs collapse into a dropdown on
@@ -95,12 +102,31 @@ Objects that are close to square (axis ratio above 0.66) are not turned.
 Align to Y axis reads the object geometry from the project file, so it takes longer on
 projects with large meshes.
 
+### Layout
+
+| Layout | Placement | Use for |
+|---|---|---|
+| Compact | tallest object in the center, shorter objects packed around it | mixed parts |
+| Rows | rows along X, tallest row in the middle, tallest object in the middle of each row | bedslingers: the bed moves in Y, so it moves less between parts in a row |
+| Grid | equal cells, tallest objects in the center cells | many similar parts |
+
 ### Plates
 
-- **Keep objects on their plates**: each plate is arranged with the objects already on it.
-  Objects that no longer fit move to new plates at the end.
-- **Regroup plates by height**: all objects are sorted tallest first and fill plate 1, then
-  plate 2, and so on. Objects of similar height end up on the same plate.
+- **Current plate only**: only the plate selected in Prepare is arranged. Other plates, and
+  their place in the object list, are not changed.
+- **All plates, objects stay on their plate**: each plate is arranged with the objects
+  already on it.
+- **All plates, regroup by height**: all objects are sorted tallest first and fill plate 1,
+  then plate 2, and so on. Objects of similar height end up on the same plate.
+
+In every mode, objects that no longer fit move to new plates at the end.
+
+### Save To
+
+- **Project file**: replaces the saved project file. The previous file is kept as
+  `<project>-backup.3mf` next to it (overwritten on the next run). The project must be
+  saved once first.
+- **New file**: writes to the path in the box, `<project>-arranged.3mf` by default.
 
 ## Command Line
 
@@ -111,7 +137,7 @@ python arrange_by_height.py project.3mf
 ```
 
 ```bash
-python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout grid --plates regroup --align-y on
+python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --plates current --plate 2 --align-y on
 ```
 
 From the command line the plugin reads the object geometry from the 3MF, which is slower for
