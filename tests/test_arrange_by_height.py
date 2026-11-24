@@ -27,6 +27,15 @@ def box_mesh(w, d, h):
     return "<mesh><vertices>%s</vertices><triangles>%s</triangles></mesh>" % (v, t)
 
 
+def pyramid_mesh(w, d, h):
+    """A pyramid on a w x d base, apex at height h."""
+    verts = [(0, 0, 0), (w, 0, 0), (w, d, 0), (0, d, 0), (w / 2.0, d / 2.0, h)]
+    tris = [(0, 2, 1), (0, 3, 2), (0, 1, 4), (1, 2, 4), (2, 3, 4), (3, 0, 4)]
+    v = "".join('<vertex x="%g" y="%g" z="%g"/>' % p for p in verts)
+    t = "".join('<triangle v1="%d" v2="%d" v3="%d"/>' % p for p in tris)
+    return "<mesh><vertices>%s</vertices><triangles>%s</triangles></mesh>" % (v, t)
+
+
 def translate(x, y, z=0.0):
     return "1 0 0 0 1 0 0 0 1 %g %g %g" % (x, y, z)
 
@@ -35,7 +44,7 @@ def rot_z90(x, y, z=0.0):
     return "0 1 0 -1 0 0 0 0 1 %g %g %g" % (x, y, z)
 
 
-def make_project(path, objects, config=None, plates=None):
+def make_project(path, objects, config=None, plates=None, extra_files=None, parts=None):
     """Write an OrcaSlicer-style 3MF.
 
     objects: list of (w, d, h, [transform, ...]) - one entry per object, one transform per
@@ -55,22 +64,34 @@ def make_project(path, objects, config=None, plates=None):
     cfg.update(config or {})
     resources, build, model_objs = [], [], []
     with zipfile.ZipFile(path, "w") as zf:
-        for i, (w, d, h, transforms) in enumerate(objects):
+        for i, entry in enumerate(objects):
+            w, d, h, transforms = entry[:4]
+            shape = entry[4] if len(entry) > 4 else "box"
+            mesh = pyramid_mesh(w, d, h) if shape == "pyramid" else box_mesh(w, d, h)
             mesh_id = 1
             obj_id = i + 2
-            sub = '<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" %s>' \
-                  '<resources><object id="%d" type="model">%s</object></resources>' \
-                  '<build/></model>' % (NS, mesh_id, box_mesh(w, d, h))
+            sub_objects = '<object id="%d" type="model">%s</object>' % (mesh_id, mesh)
+            components = '<component p:path="/%s" objectid="%d" transform="%s"/>'
             name = "3D/Objects/object_%d.model" % (i + 1)
+            comp = components % (name, mesh_id, translate(-w / 2, -d / 2, 0))
+            if shape == "modifier":
+                # A large modifier box next to the part.
+                sub_objects += '<object id="2" type="model">%s</object>' % box_mesh(80, 80, 5)
+                comp += components % (name, 2, translate(w, 0, 0))
+            sub = '<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" %s>' \
+                  '<resources>%s</resources><build/></model>' % (NS, sub_objects)
             zf.writestr(name, sub)
             resources.append(
-                '  <object id="%d" type="model"><components>'
-                '<component p:path="/%s" objectid="%d" transform="%s"/>'
-                '</components></object>\n' % (obj_id, name, mesh_id, translate(-w / 2, -d / 2, 0)))
+                '  <object id="%d" type="model"><components>%s</components></object>\n'
+                % (obj_id, comp))
             for t in transforms:
                 build.append('  <item objectid="%d" transform="%s" printable="1"/>\n' % (obj_id, t))
+            part_xml = ""
+            if shape == "modifier":
+                part_xml = ('    <part id="1" subtype="normal_part"/>\n'
+                            '    <part id="2" subtype="modifier_part"/>\n')
             model_objs.append('  <object id="%d">\n    <metadata key="name" value="Part %d"/>\n'
-                              '  </object>\n' % (obj_id, i + 1))
+                              '%s  </object>\n' % (obj_id, i + 1, part_xml))
         model = ('<?xml version="1.0" encoding="UTF-8"?>\n<model unit="millimeter" %s>\n'
                  ' <resources>\n%s </resources>\n <build>\n%s </build>\n</model>\n'
                  % (NS, "".join(resources), "".join(build)))
@@ -96,6 +117,8 @@ def make_project(path, objects, config=None, plates=None):
         zf.writestr(abh.MODEL_SETTINGS_PATH, settings)
         zf.writestr(abh.PROJECT_SETTINGS_PATH, json.dumps(cfg))
         zf.writestr("Metadata/plate_1.png", b"png")
+        for name, text in (extra_files or {}).items():
+            zf.writestr(name, text)
 
 
 def read_result(path):
@@ -482,6 +505,141 @@ class CurrentPlateTest(Base):
                 abh.DEFAULT_SETTINGS, plates="current", plate_index=3))
 
 
+class LayerHeightTest(Base):
+    def params(self, height):
+        return abh.SlicingParams({"layer_height": "0.2", "initial_layer_print_height": "0.2",
+                                  "min_layer_height": ["0.08"], "max_layer_height": ["0.28"],
+                                  "nozzle_diameter": ["0.4"]}, {}, height)
+
+    def mesh(self, shape, w=40, d=40, h=20):
+        make_project(self.src, [(w, d, h, [translate(50, 50)], shape)])
+        with zipfile.ZipFile(self.src) as zf:
+            lib = abh.MeshLibrary(zf)
+            return lib.triangles("/" + abh.MODEL_PATH, "2", abh.parse_transform(
+                translate(50, 50)))
+
+    def check(self, profile, params):
+        self.assertEqual(profile[:4], [0.0, 0.2, 0.2, 0.2])
+        self.assertEqual(len(profile) % 2, 0)
+        zs, hs = profile[0::2], profile[1::2]
+        self.assertEqual(zs, sorted(zs))
+        self.assertAlmostEqual(zs[-1] + 0, zs[-1])
+        for h in hs:
+            self.assertGreaterEqual(h, params.min_layer_height - 1e-9)
+            self.assertLessEqual(h, params.max_layer_height + 1e-9)
+        return zs, hs
+
+    def test_params(self):
+        p = self.params(20)
+        self.assertEqual((p.min_layer_height, p.max_layer_height), (0.08, 0.28))
+        q = abh.SlicingParams({"layer_height": "0.2", "nozzle_diameter": ["0.4"]},
+                              {"layer_height": "0.12"}, 5)
+        self.assertEqual(q.layer_height, 0.12)
+        self.assertAlmostEqual(q.min_layer_height, 0.07)
+        self.assertAlmostEqual(q.max_layer_height, 0.3)
+
+    def test_box_uses_thick_layers(self):
+        params = self.params(20)
+        zs, hs = self.check(abh.adaptive_profile(self.mesh("box"), params, 0.5), params)
+        # Vertical walls: layers grow by 0.04 steps to the maximum.
+        self.assertAlmostEqual(hs[2], 0.24, places=6)
+        self.assertAlmostEqual(max(hs), 0.28, places=6)
+        # The last layer ends at the top of the object.
+        self.assertAlmostEqual(zs[-2] + hs[-2], 20, places=4)
+
+    def test_slope_uses_thinner_layers(self):
+        params = self.params(20)
+        tris = self.mesh("pyramid", 80, 80, 20)
+        fine = abh.adaptive_profile(tris, params, 0.0)
+        coarse = abh.adaptive_profile(tris, params, 1.0)
+        self.check(fine, params)
+        self.check(coarse, params)
+        self.assertGreater(len(fine), len(coarse))
+        box = abh.adaptive_profile(self.mesh("box"), params, 0.5)
+        mid = abh.adaptive_profile(tris, params, 0.5)
+        self.assertGreater(len(mid), len(box))
+
+    def test_height_range_overrides(self):
+        params = self.params(20)
+        prof = abh.adaptive_profile(self.mesh("box"), params, 0.5, [(5.0, 10.0, 0.1)])
+        inside = [h for z, h in zip(prof[0::2], prof[1::2]) if 5.2 <= z <= 9.8]
+        self.assertTrue(inside)
+        self.assertTrue(all(abs(h - 0.1) < 1e-9 for h in inside))
+
+    def test_smooth(self):
+        params = self.params(20)
+        prof = abh.adaptive_profile(self.mesh("pyramid", 80, 80, 20), params, 0.0)
+        smooth = abh.smooth_profile(prof, params, 5, False)
+        keep = abh.smooth_profile(prof, params, 5, True)
+        self.assertEqual(len(smooth), len(prof))
+        self.assertEqual(smooth[:4], prof[:4])
+
+        def roughness(p):
+            hs = p[5::2]
+            return sum(abs(a - b) for a, b in zip(hs, hs[1:]))
+        self.assertLessEqual(roughness(smooth), roughness(prof) + 1e-9)
+        for a, b in zip(keep[1::2], prof[1::2]):
+            self.assertLessEqual(a, b + 1e-9)
+
+    def test_written_for_current_plate(self):
+        objects = [(20, 20, 10, [translate(30, 30)]), (20, 20, 15, [translate(270, 30)]),
+                   (60, 60, 20, [translate(400, 100)], "pyramid")]
+        make_project(self.src, objects, plates=[[(0, 0)], [(1, 0), (2, 0)]])
+        summary = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="current", plate_index=1, adaptive=True,
+            adaptive_quality=0.3, smooth=True, smooth_radius=3))
+        self.assertEqual(summary["layer_heights"], 2)
+        with zipfile.ZipFile(self.out) as zf:
+            profiles = abh.parse_profiles(zf.read(abh.LAYER_HEIGHTS_PATH).decode())
+        project, _ = read_result(self.out)
+        order = [it.object_id for it in project.items]
+        self.assertEqual(sorted(profiles), [order.index("3") + 1, order.index("4") + 1])
+        pyramid = profiles[order.index("4") + 1]
+        self.assertAlmostEqual(pyramid[-2], 20, places=3)
+
+    def test_smooth_alone_uses_existing_profile(self):
+        objects = [(20, 20, 10, [translate(30, 30)]), (20, 20, 5, [translate(80, 30)])]
+        existing = "object_id=1|0;0.2;0.2;0.2;2;0.08;4;0.28;6;0.08;8;0.28;10;0.2\n"
+        make_project(self.src, objects, extra_files={abh.LAYER_HEIGHTS_PATH: existing})
+        summary = abh.arrange_file(self.src, self.out, dict(
+            abh.DEFAULT_SETTINGS, plates="keep", smooth=True, smooth_radius=2))
+        self.assertEqual(summary["layer_heights"], 1)
+        with zipfile.ZipFile(self.out) as zf:
+            profiles = abh.parse_profiles(zf.read(abh.LAYER_HEIGHTS_PATH).decode())
+        # The short object now comes first, so the profile moves to place 2.
+        self.assertEqual(list(profiles), [2])
+        self.assertNotEqual(profiles[2][5], 0.08)
+
+    def test_existing_files_follow_their_objects(self):
+        objects = [(20, 20, 30, [translate(30, 30)]), (20, 20, 5, [translate(80, 30)])]
+        extra = {
+            abh.LAYER_HEIGHTS_PATH: "object_id=1|0;0.2;30;0.2\nobject_id=2|0;0.2;5;0.1\n",
+            "Metadata/brim_ear_points.txt": "object_id=2|1 2 3 4\n",
+            "Metadata/layer_config_ranges.xml":
+                '<?xml version="1.0"?>\n<objects>\n <object id="1">\n'
+                '  <range min_z="1" max_z="2"><option opt_key="layer_height">0.1</option>'
+                '</range>\n </object>\n</objects>\n',
+        }
+        make_project(self.src, objects, extra_files=extra)
+        abh.arrange_file(self.src, self.out, dict(abh.DEFAULT_SETTINGS, plates="keep"))
+        with zipfile.ZipFile(self.out) as zf:
+            heights = zf.read(abh.LAYER_HEIGHTS_PATH).decode()
+            ears = zf.read("Metadata/brim_ear_points.txt").decode()
+            ranges = zf.read("Metadata/layer_config_ranges.xml").decode()
+        # The object list is now [short, tall].
+        self.assertEqual(abh.parse_profiles(heights), {2: [0, 0.2, 30, 0.2],
+                                                       1: [0, 0.2, 5, 0.1]})
+        self.assertEqual(ears, "object_id=1|1 2 3 4\n")
+        self.assertIn('<object id="2">', ranges)
+
+    def test_modifier_not_counted(self):
+        make_project(self.src, [(20, 20, 10, [translate(50, 50)], "modifier")])
+        project = abh.Project(self.src)
+        project.load_bboxes()
+        self.assertAlmostEqual(project.items[0].width, 20)
+        self.assertAlmostEqual(project.items[0].height, 10)
+
+
 class FakeOrca:
     """The parts of OrcaSlicer's embedded `orca` module the plugin uses."""
 
@@ -635,7 +793,10 @@ class CommandLineTest(Base):
         make_project(self.src, [(20, 20, 10, [translate(50, 50)])])
         self.assertEqual(abh.main([self.src, "-o", self.out, "--spacing", "3",
                                    "--align-y", "on", "--layout", "rows",
-                                   "--plates", "current", "--plate", "1"]), 0)
+                                   "--plates", "current", "--plate", "1",
+                                   "--adaptive", "0.4", "--smooth", "4", "--keep-min"]), 0)
+        with zipfile.ZipFile(self.out) as zf:
+            self.assertIn(abh.LAYER_HEIGHTS_PATH, zf.namelist())
         self.assertTrue(os.path.exists(self.out))
 
 

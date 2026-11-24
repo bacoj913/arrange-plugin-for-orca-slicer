@@ -17,6 +17,8 @@ tab to the top bar, next to Prepare and Preview.
   cells).
 - **Plates**: the selected plate only, every plate with objects kept on their plate, or
   every plate regrouped so objects of similar height share a plate.
+- **Layer height**: Adaptive layer height (Quality / Speed slider) and Smooth (Radius
+  slider, Keep min) for every arranged object, as in the Variable Layer Height tool.
 - **Save to** the project file (a backup is kept) or a new file.
 - **Align to Y axis**: turns long objects so their long side runs along Y, for bedslinger
   printers such as the Bambu Lab A1. Auto turns it on when the printer structure is i3, as
@@ -110,6 +112,26 @@ projects with large meshes.
 | Rows | rows along X, tallest row in the middle, tallest object in the middle of each row | bedslingers: the bed moves in Y, so it moves less between parts in a row |
 | Grid | equal cells, tallest objects in the center cells | many similar parts |
 
+### Layer Height
+
+| Setting | Effect |
+|---|---|
+| Adaptive layer height | thin layers on shallow slopes, thick layers on steep walls |
+| Quality / Speed | 0 = thinnest layers (quality) to 1 = thickest layers (speed); default 0.5 |
+| Smooth | evens out sudden changes in layer height |
+| Radius | 1 to 10 layers; larger is smoother; default 5 |
+| Keep min | smoothing never makes a layer thicker than before |
+
+These use the same algorithms as **Adaptive** and **Smooth** in OrcaSlicer's Variable Layer
+Height tool, with the layer height, first layer height, and min / max layer height from your
+printer and process settings (and each object's own layer height, if set). They apply to
+every object that is arranged: on **Current plate only**, the objects on that plate.
+**Smooth** without **Adaptive** smooths each object's current profile; objects without one
+are left as they are. Height range modifiers keep their layer height.
+
+To check the result, select an object and open the Variable Layer Height tool after
+opening the project again.
+
 ### Plates
 
 - **Current plate only**: only the plate selected in Prepare is arranged. Other plates, and
@@ -137,7 +159,7 @@ python arrange_by_height.py project.3mf
 ```
 
 ```bash
-python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --plates current --plate 2 --align-y on
+python arrange_by_height.py project.3mf -o out.3mf --spacing 5 --layout rows --plates current --plate 2 --align-y on --adaptive 0.35 --smooth 5
 ```
 
 From the command line the plugin reads the object geometry from the 3MF, which is slower for

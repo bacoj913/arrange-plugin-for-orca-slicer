@@ -22,6 +22,8 @@ Layout rules:
 - Grid: equal cells, tallest objects in the center cells.
 - Only the selected plate, or every plate, is arranged. Objects that no longer fit go to
   new plates at the end.
+- Adaptive layer height and Smooth set each arranged object's layer height profile, as
+  the Variable Layer Height tool does.
 - The object list is set per plate from shortest to tallest. With print sequence
   "By object", OrcaSlicer prints in object list order, so tall objects print last.
 - Spacing is a fixed value in mm, or Auto: OrcaSlicer's own arrange spacing for the plate's
@@ -32,7 +34,7 @@ Layout rules:
 Command line (no OrcaSlicer needed):
     python arrange_by_height.py project.3mf [-o out.3mf] [--spacing auto|MM]
         [--layout compact|rows|grid] [--plates all|regroup|current] [--plate N]
-        [--align-y auto|on|off]
+        [--align-y auto|on|off] [--adaptive QUALITY] [--smooth RADIUS [--keep-min]]
 """
 
 import argparse
@@ -55,6 +57,10 @@ except ImportError:
 MODEL_PATH = "3D/3dmodel.model"
 MODEL_SETTINGS_PATH = "Metadata/model_settings.config"
 PROJECT_SETTINGS_PATH = "Metadata/project_settings.config"
+LAYER_HEIGHTS_PATH = "Metadata/layer_heights_profile.txt"
+# Files that refer to objects by their 1-based place in the object list.
+LINE_INDEXED_PATHS = (LAYER_HEIGHTS_PATH, "Metadata/brim_ear_points.txt")
+XML_INDEXED_PATHS = ("Metadata/layer_config_ranges.xml", "Metadata/cut_information.xml")
 
 # Values from OrcaSlicer's source (PartPlate.cpp, Print.hpp, PartPlate.hpp).
 PLATE_GAP = 1.0 / 5.0
@@ -66,6 +72,11 @@ DEFAULT_SETTINGS = {
     "plates": "current",     # "current" (the plate in plate_index), "keep" or "regroup"
     "output": "new",         # "new" file or "replace" the project file
     "align_y": "auto",       # "auto", "on" or "off"
+    "adaptive": False,       # adaptive layer height for the arranged objects
+    "adaptive_quality": 0.5,  # 0 = quality (thin layers) ... 1 = speed (thick layers)
+    "smooth": False,         # smooth the layer height profile
+    "smooth_radius": 5,      # 1 ... 10
+    "smooth_keep_min": False,
 }
 MIN_AUTO_GAP = 2.0           # mm, used for "By layer" when there is no brim
 ROW_BAND = 20.0              # mm, row height used to order objects of equal height
@@ -744,6 +755,262 @@ def _sorted_objects(items):
 
 
 # ---------------------------------------------------------------------------
+# Layer heights (port of OrcaSlicer's Slicing.cpp and SlicingAdaptive.cpp)
+# ---------------------------------------------------------------------------
+
+SLICE_EPSILON = 1e-4             # EPSILON in libslic3r
+MIN_LAYER_HEIGHT = 0.01
+MIN_LAYER_HEIGHT_DEFAULT = 0.07
+LAYER_HEIGHT_CHANGE_STEP = 0.04
+
+
+class SlicingParams:
+    """The parts of OrcaSlicer's SlicingParameters the layer height tools use."""
+
+    def __init__(self, config, object_config, object_height):
+        def value(key, default=0.0):
+            v = object_config.get(key)
+            return _num(v if v not in (None, "") else config.get(key), default)
+
+        self.layer_height = value("layer_height", 0.2)
+        first = value("initial_layer_print_height", 0.0)
+        self.first_object_layer_height = first if first > 0 else self.layer_height
+        raft = int(value("raft_layers", 0))
+        # With a raft the first object layer is a normal layer and may change.
+        self.first_layer_fixed = raft == 0
+        if raft:
+            self.first_object_layer_height = self.layer_height
+        nozzle = max(int(value("extruder", 1)), 1) - 1
+        lo = _at(config.get("min_layer_height"), nozzle)
+        lo = MIN_LAYER_HEIGHT_DEFAULT if lo == 0 else max(MIN_LAYER_HEIGHT, lo)
+        hi = _at(config.get("max_layer_height"), nozzle)
+        if hi == 0:
+            hi = 0.75 * (_at(config.get("nozzle_diameter"), nozzle) or 0.4)
+        hi = max(lo, hi)
+        self.min_layer_height = min(max(MIN_LAYER_HEIGHT, lo), self.layer_height)
+        self.max_layer_height = max(hi, self.layer_height)
+        self.object_height = object_height
+
+
+def _at(values, index, default=0.0):
+    if isinstance(values, str):
+        values = values.split(",")
+    if not values:
+        return default
+    try:
+        return float(values[min(index, len(values) - 1)])
+    except (TypeError, ValueError):
+        return default
+
+
+def _faces(triangles, z_min):
+    """(z_low, z_high, |n.z|, |n.xy|) for each triangle, sorted by z span."""
+    faces = []
+    for a, b, c in triangles:
+        ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+        vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
+        nx, ny, nz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+        length = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if length == 0:
+            continue
+        zs = (a[2] - z_min, b[2] - z_min, c[2] - z_min)
+        faces.append((min(zs), max(zs), abs(nz) / length, math.hypot(nx, ny) / length))
+    faces.sort()
+    return faces
+
+
+def _slope_height(face, deviation):
+    """layer_height_from_slope in SlicingAdaptive.cpp."""
+    n_cos, n_sin = face[2], face[3]
+    limit = 1.44 * deviation * math.sqrt(n_sin / n_cos) if n_cos > 1e-5 else float("inf")
+    return min(deviation / 0.184, limit)
+
+
+def _deviation(params, quality):
+    """The allowed surface deviation for a Quality / Speed value."""
+    if quality < 0.5:
+        return params.min_layer_height + (
+            params.layer_height - params.min_layer_height) * 2.0 * quality
+    return params.max_layer_height + (
+        params.layer_height - params.max_layer_height) * 2.0 * (1.0 - quality)
+
+
+def _next_layer_height(faces, params, print_z, deviation, state):
+    """SlicingAdaptive::next_layer_height. `state` holds the first face index to visit."""
+    height = params.max_layer_height
+    i = state[0]
+    first_hit = False
+    while i < len(faces):
+        z0, z1 = faces[i][0], faces[i][1]
+        if z0 >= print_z:
+            break
+        if z1 > print_z:
+            if not first_hit:
+                first_hit = True
+                state[0] = i
+            if z1 >= print_z + SLICE_EPSILON:
+                height = min(height, _slope_height(faces[i], deviation))
+        i += 1
+    height = max(height, params.min_layer_height)
+    if height > params.min_layer_height:
+        while i < len(faces):
+            z0, z1 = faces[i][0], faces[i][1]
+            if z0 >= print_z + height:
+                break
+            if z1 >= print_z + SLICE_EPSILON:
+                reduced = _slope_height(faces[i], deviation)
+                z_diff = z0 - print_z
+                if reduced < z_diff:
+                    height = z_diff
+                elif reduced < height:
+                    height = reduced
+            i += 1
+        height = max(height, params.min_layer_height)
+    return height
+
+
+def adaptive_profile(triangles, params, quality, height_ranges=()):
+    """layer_height_profile_adaptive in Slicing.cpp: [z0, h0, z1, h1, ...]."""
+    z_min = min(min(t[0][2], t[1][2], t[2][2]) for t in triangles)
+    deviation = _deviation(params, quality)
+    # A face that allows the maximum layer height never lowers a layer (steep walls), so
+    # leaving it out gives the same profile, much faster for tall parts.
+    faces = [f for f in _faces(triangles, z_min)
+             if _slope_height(f, deviation) < params.max_layer_height]
+    first = params.first_object_layer_height
+    profile = [0.0, first]
+    if params.first_layer_fixed:
+        profile += [first, first]
+    print_z = first
+    state = [0]
+    while print_z + SLICE_EPSILON < params.object_height:
+        height = min(_next_layer_height(faces, params, print_z, deviation, state),
+                     params.max_layer_height)
+        last = profile[-1]
+        if last < height and height - last > LAYER_HEIGHT_CHANGE_STEP:
+            height = last + LAYER_HEIGHT_CHANGE_STEP
+        elif last > height and last - height > LAYER_HEIGHT_CHANGE_STEP:
+            height = last - LAYER_HEIGHT_CHANGE_STEP
+        for lo, hi, h in height_ranges:
+            if lo <= print_z <= hi:
+                height = h
+                break
+        profile += [print_z, height]
+        print_z += height
+    z_gap = params.object_height - profile[-2]
+    if z_gap > 0:
+        profile += [params.object_height,
+                    min(max(z_gap, params.min_layer_height), params.max_layer_height)]
+    return profile
+
+
+def smooth_profile(profile, params, radius=5, keep_min=False):
+    """smooth_height_profile in Slicing.cpp: a biased Gaussian blur, applied six times."""
+    radius = max(int(radius), 1)
+    size = 2 * radius + 1
+    sigma = 0.3 * (radius - 1) + 0.8
+    two_sq_sigma = 2.0 * sigma * sigma
+    scale = 1.0 / math.sqrt(math.pi * two_sq_sigma)
+    kernel = [scale * math.exp(-((i - radius) ** 2) / two_sq_sigma) for i in range(size)]
+    skip = 4 if params.first_layer_fixed else 0
+    delta_h = params.max_layer_height - params.min_layer_height
+    inv_delta_h = 1.0 / delta_h if delta_h != 0 else 1.0
+    max_dz_band = radius * params.layer_height
+
+    def blur(prof):
+        n = len(prof)
+        if n - skip < 6:
+            return list(prof)
+        out = list(prof[:skip])
+        for i in range(skip, n, 2):
+            zi, hi = prof[i], prof[i + 1]
+            begin = max(i - 2 * radius, skip)
+            end = min(i + 2 * radius, n - 2)
+            total = weight_total = 0.0
+            for j in range(begin, end + 1, 2):
+                k = radius + (j - i) // 2
+                if abs(zi - prof[j]) * params.layer_height <= max_dz_band:
+                    dh = abs(params.max_layer_height - prof[j + 1])
+                    w = kernel[k] * math.sqrt(dh * inv_delta_h)
+                    total += w * prof[j + 1]
+                    weight_total += w
+            h = hi if weight_total == 0 else total / weight_total
+            h = min(max(h, params.min_layer_height), params.max_layer_height)
+            if keep_min:
+                h = min(h, hi)
+            out += [zi, h]
+        return out
+
+    for _ in range(6):
+        profile = blur(profile)
+    return profile
+
+
+def parse_profiles(text):
+    """{object index: [floats]} from layer_heights_profile.txt."""
+    out = {}
+    for line in (text or "").splitlines():
+        head, _, body = line.partition("|")
+        key, _, index = head.partition("=")
+        if key.strip() != "object_id" or not body:
+            continue
+        try:
+            out[int(index)] = [float(v) for v in body.split(";")]
+        except ValueError:
+            continue
+    return out
+
+
+def format_profiles(profiles):
+    lines = []
+    for index in sorted(profiles):
+        values = profiles[index]
+        if len(values) >= 4 and len(values) % 2 == 0:
+            lines.append("object_id=%d|%s" % (index, ";".join("%f" % v for v in values)))
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
+def parse_height_ranges(xml_text, index):
+    """[(min_z, max_z, layer_height)] of one object from layer_config_ranges.xml."""
+    ranges = []
+    if not xml_text:
+        return ranges
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return ranges
+    for obj in root.iter("object"):
+        if obj.get("id") != str(index):
+            continue
+        for rng in obj.findall("range"):
+            for opt in rng.findall("option"):
+                if opt.get("opt_key") == "layer_height":
+                    try:
+                        ranges.append((float(rng.get("min_z")), float(rng.get("max_z")),
+                                       float(opt.text)))
+                    except (TypeError, ValueError):
+                        pass
+    return ranges
+
+
+def remap_line_indexed(text, mapping):
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"(\s*object_id\s*=\s*)(\d+)(\|.*)", line)
+        if m and int(m.group(2)) in mapping:
+            line = "%s%d%s" % (m.group(1), mapping[int(m.group(2))], m.group(3))
+        out.append(line)
+    return "\n".join(out) + ("\n" if text.endswith("\n") else "")
+
+
+def remap_xml_indexed(text, mapping):
+    def sub(m):
+        old = int(m.group(2))
+        return "%s%d%s" % (m.group(1), mapping.get(old, old), m.group(3))
+    return re.sub(r'(<object\b[^>]*?\bid=")(\d+)(")', sub, text)
+
+
+# ---------------------------------------------------------------------------
 # 3MF reading
 # ---------------------------------------------------------------------------
 
@@ -829,7 +1096,8 @@ class MeshLibrary:
                 tag = _local(el.tag)
                 if event == "start":
                     if tag == "object":
-                        current = {"id": el.get("id"), "vertices": None, "components": []}
+                        current = {"id": el.get("id"), "vertices": None, "triangles": [],
+                                   "components": []}
                     elif tag == "vertices":
                         verts = []
                     continue
@@ -840,6 +1108,9 @@ class MeshLibrary:
                     current["vertices"] = verts
                     verts = None
                 elif tag == "triangle":
+                    if current is not None:
+                        current["triangles"].append(
+                            (int(el.get("v1")), int(el.get("v2")), int(el.get("v3"))))
                     el.clear()
                 elif tag == "component" and current is not None:
                     cpath = None
@@ -853,35 +1124,60 @@ class MeshLibrary:
                     current = None
                     el.clear()
 
-    def points(self, path, object_id, transform, depth=0):
-        """Every vertex of the object, in world coordinates."""
-        if depth > 10:
-            raise ArrangeError("The 3MF file has circular components.")
+    def _object(self, path, object_id):
         self._load(path)
         obj = self.objects.get((path, object_id))
         if obj is None:
             raise ArrangeError("Object %s is missing from %s." % (object_id, path))
+        return obj
+
+    def points(self, path, object_id, transform, depth=0, parts=None):
+        """Every vertex of the object, in world coordinates.
+
+        `parts` lists, for each top-level component, whether it is a model part; modifiers
+        and other volumes are left out.
+        """
+        if depth > 10:
+            raise ArrangeError("The 3MF file has circular components.")
+        obj = self._object(path, object_id)
         out = [apply_transform(transform, v) for v in obj["vertices"] or ()]
-        for cid, cpath, ctrans in obj["components"]:
+        for k, (cid, cpath, ctrans) in enumerate(obj["components"]):
+            if parts is not None and k < len(parts) and not parts[k]:
+                continue
             out.extend(self.points(cpath, cid, compose(ctrans, transform), depth + 1))
         return out
 
-    def bbox(self, path, object_id, transform):
-        pts = self.points(path, object_id, transform)
+    def triangles(self, path, object_id, transform, depth=0, parts=None):
+        """Every triangle of the object as three world-coordinate vertices."""
+        if depth > 10:
+            raise ArrangeError("The 3MF file has circular components.")
+        obj = self._object(path, object_id)
+        out = []
+        if obj["vertices"]:
+            verts = [apply_transform(transform, v) for v in obj["vertices"]]
+            out.extend((verts[a], verts[b], verts[c]) for a, b, c in obj["triangles"])
+        for k, (cid, cpath, ctrans) in enumerate(obj["components"]):
+            if parts is not None and k < len(parts) and not parts[k]:
+                continue
+            out.extend(self.triangles(cpath, cid, compose(ctrans, transform), depth + 1))
+        return out
+
+    def bbox(self, path, object_id, transform, parts=None):
+        pts = self.points(path, object_id, transform, parts=parts)
         if not pts:
             return None
         xs, ys, zs = zip(*pts)
         return (min(xs), min(ys), min(zs), max(xs), max(ys), max(zs))
 
-    def footprint(self, path, object_id, transform):
+    def footprint(self, path, object_id, transform, parts=None):
         """Convex outline (x, y) seen from above, and the z range, in world coordinates."""
         # Instances that differ only by position share one outline.
         linear = tuple(tuple(round(v, 9) for v in row) for row in transform[:3])
-        key = (path, object_id, linear)
+        key = (path, object_id, linear, tuple(parts or ()))
         cache = self.__dict__.setdefault("_footprints", {})
         if key not in cache:
             local = [row[:] for row in transform[:3]] + [[0.0, 0.0, 0.0]]
-            pts = self.points(path, object_id, local)
+            pts = self.points(path, object_id, local, parts=parts)
             if not pts:
                 cache[key] = None
             else:
@@ -929,16 +1225,21 @@ def read_plates(settings_xml):
     return mapping, max(len(plates), 1), sequences
 
 
-def read_object_names(settings_xml):
-    """{object_id: name} from model_settings.config."""
-    names = {}
+def read_object_info(settings_xml):
+    """Per-object data from model_settings.config.
+
+    Returns {object_id: {"name", "parts", "config"}}: "parts" lists, in volume order,
+    whether each volume is a model part; "config" holds the object's own settings.
+    """
+    info = {}
     if not settings_xml:
-        return names
+        return info
     for obj in ET.fromstring(settings_xml).findall("object"):
-        for m in obj.findall("metadata"):
-            if m.get("key") == "name":
-                names[obj.get("id")] = m.get("value") or ""
-    return names
+        config = {m.get("key"): m.get("value") for m in obj.findall("metadata")}
+        parts = [p.get("subtype", "normal_part") == "normal_part" for p in obj.findall("part")]
+        info[obj.get("id")] = {"name": config.get("name") or "", "parts": parts or None,
+                               "config": config}
+    return info
 
 
 class Project:
@@ -958,7 +1259,13 @@ class Project:
         self.build = read_build_items(self.model_xml)
         self.bed = bed_from_config(self.config)
         mapping, self.plate_count, self.plate_sequences = read_plates(self.settings_xml)
-        self.names = read_object_names(self.settings_xml)
+        self.info = read_object_info(self.settings_xml)
+        self.names = {oid: i["name"] for oid, i in self.info.items()}
+        with zipfile.ZipFile(path) as zf:
+            names = zf.namelist()
+            self.indexed_files = {n: zf.read(n).decode("utf-8", "replace")
+                                  for n in LINE_INDEXED_PATHS + XML_INDEXED_PATHS
+                                  if n in names}
         self.items = []
         counts = {}
         for index, (object_id, _path, transform) in enumerate(self.build):
@@ -986,17 +1293,99 @@ class Project:
             with zipfile.ZipFile(self.path) as zf:
                 lib = MeshLibrary(zf)
                 for it, (object_id, path, _t) in zip(self.items, self.build):
-                    it.bbox = lib.bbox(path or "/" + MODEL_PATH, object_id, it.transform)
+                    it.bbox = lib.bbox(path or "/" + MODEL_PATH, object_id, it.transform,
+                                       parts=self._parts(object_id))
                     if it.bbox is None:
                         raise ArrangeError("Object %s has no geometry." % object_id)
         self._to_plate_coordinates()
+
+    def _parts(self, object_id):
+        return (self.info.get(object_id) or {}).get("parts")
+
+    def _object_index(self, order):
+        """{object_id: 1-based place in the object list} for an object order."""
+        return {oid: i + 1 for i, oid in enumerate(order)}
+
+    def _original_order(self):
+        order = []
+        for it in sorted(self.items, key=lambda i: i.index):
+            if it.object_id not in order:
+                order.append(it.object_id)
+        return order
+
+    def layer_heights(self, settings):
+        """Adaptive and smoothed layer heights for the moved objects.
+
+        Returns {object_id: profile}. Smooth without Adaptive smooths the object's existing
+        profile, as OrcaSlicer's Smooth button does.
+        """
+        adaptive = bool(settings.get("adaptive"))
+        smooth = bool(settings.get("smooth"))
+        if not (adaptive or smooth):
+            return {}
+        quality = min(max(float(settings.get("adaptive_quality", 0.5)), 0.0), 1.0)
+        radius = min(max(int(settings.get("smooth_radius", 5)), 1), 10)
+        keep_min = bool(settings.get("smooth_keep_min"))
+        old_index = self._object_index(self._original_order())
+        existing = parse_profiles(self.indexed_files.get(LAYER_HEIGHTS_PATH))
+        ranges_xml = self.indexed_files.get("Metadata/layer_config_ranges.xml")
+        moved = []
+        for it in self.items:
+            if it.moved and it.object_id not in moved:
+                moved.append(it.object_id)
+        first_item = {}
+        for it in sorted(self.items, key=lambda i: i.index):
+            first_item.setdefault(it.object_id, it)
+        out = {}
+        with zipfile.ZipFile(self.path) as zf:
+            lib = MeshLibrary(zf)
+            for object_id in moved:
+                it = first_item[object_id]
+                path = self.build[it.index][1] or "/" + MODEL_PATH
+                tris = lib.triangles(path, object_id, it.transform, parts=self._parts(object_id))
+                if not tris:
+                    continue
+                zs = [v[2] for t in tris for v in t]
+                obj_config = (self.info.get(object_id) or {}).get("config") or {}
+                params = SlicingParams(self.config, obj_config, max(zs) - min(zs))
+                profile = None
+                if adaptive:
+                    profile = adaptive_profile(
+                        tris, params, quality,
+                        parse_height_ranges(ranges_xml, old_index[object_id]))
+                elif old_index[object_id] in existing:
+                    profile = existing[old_index[object_id]]
+                if profile and smooth:
+                    profile = smooth_profile(profile, params, radius, keep_min)
+                if profile:
+                    out[object_id] = profile
+        return out
+
+    def _indexed_files(self, new_order):
+        """The files keyed by object list place, renumbered for `new_order`."""
+        old_index = self._object_index(self._original_order())
+        new_index = self._object_index(new_order)
+        mapping = {old_index[oid]: new_index[oid] for oid in old_index}
+        files = {}
+        for name, text in self.indexed_files.items():
+            if name in LINE_INDEXED_PATHS:
+                files[name] = remap_line_indexed(text, mapping)
+            else:
+                files[name] = remap_xml_indexed(text, mapping)
+        if self.profiles:
+            merged = parse_profiles(files.get(LAYER_HEIGHTS_PATH))
+            for object_id, profile in self.profiles.items():
+                merged[new_index[object_id]] = profile
+            files[LAYER_HEIGHTS_PATH] = format_profiles(merged)
+        return files
 
     def _align_y(self, only_plate=None):
         cols = plate_columns(self.plate_count)
         with zipfile.ZipFile(self.path) as zf:
             lib = MeshLibrary(zf)
             for it, (object_id, path, _t) in zip(self.items, self.build):
-                fp = lib.footprint(path or "/" + MODEL_PATH, object_id, it.transform)
+                fp = lib.footprint(path or "/" + MODEL_PATH, object_id, it.transform,
+                                   parts=self._parts(object_id))
                 if fp is None:
                     raise ArrangeError("Object %s has no geometry." % object_id)
                 hull, z0, z1 = fp
@@ -1034,6 +1423,7 @@ class Project:
                                        self.config, self.plate_sequences)
         moved = [it for it in self.items if it.moved]
         self.changed_plates = set(it.plate for it in moved) | set(before[it.index] for it in moved)
+        self.profiles = self.layer_heights(settings)
         if self.new_plate_count != self.plate_count:
             # The plate grid changes, so OrcaSlicer moves every plate: redo all thumbnails.
             self.changed_plates = set(range(self.new_plate_count))
@@ -1051,6 +1441,7 @@ class Project:
             new_transform[it.index] = format_transform(m)
         model_xml = self._rewrite_build(new_transform)
         settings_xml = self._rewrite_plates()
+        indexed = self._indexed_files(object_order(self.items))
         tmp = out_path + ".tmp"
         with zipfile.ZipFile(self.path) as src, \
                 zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as dst:
@@ -1059,8 +1450,12 @@ class Project:
                     dst.writestr(info, model_xml.encode("utf-8"))
                 elif info.filename == MODEL_SETTINGS_PATH and settings_xml is not None:
                     dst.writestr(info, settings_xml.encode("utf-8"))
+                elif info.filename in indexed:
+                    dst.writestr(info, indexed.pop(info.filename).encode("utf-8"))
                 else:
                     dst.writestr(info, src.read(info.filename))
+            for name, text in indexed.items():   # a layer height file the project did not have
+                dst.writestr(name, text.encode("utf-8"))
         os.replace(tmp, out_path)
 
     def _rewrite_build(self, new_transform):
@@ -1144,6 +1539,7 @@ def arrange_file(in_path, out_path, settings, bboxes=None):
         "plates": project.new_plate_count,
         "plates_before": project.plate_count,
         "aligned": align,
+        "layer_heights": len(project.profiles),
         "rotated": sum(1 for it in project.items if it.rotated),
         "bed": [bed.x0, bed.y0, bed.x1, bed.y1],
         "changed": sorted(p + 1 for p in project.changed_plates),
@@ -1177,6 +1573,13 @@ label { display: block; margin: 4px 0; }
 input[type=number] { width: 70px; }
 input[type=text] { width: 100%; box-sizing: border-box; }
 select { min-width: 90px; }
+.slider { display: flex; align-items: center; gap: 8px; margin: 2px 0 6px 22px;
+  font-size: 12px; color: var(--orca-muted, #666); }
+.slider span { width: 92px; flex: none; }
+.slider input { flex: 1; min-width: 0; accent-color: var(--orca-accent, #009688); }
+.slider output { width: 32px; text-align: right; color: var(--orca-fg, #000); }
+.indent { margin-left: 22px; font-size: 13px; }
+.off { opacity: 0.45; }
 #arrange { width: 100%; padding: 6px; font-weight: 600; }
 #status { margin: 0 0 12px; min-height: 1.2em; white-space: pre-wrap; }
 #status.error { color: #d9534f; }
@@ -1225,6 +1628,20 @@ select { min-width: 90px; }
     Auto: on for bedslinger printers (printer structure i3).
     <span id="printer"></span></div>
 </fieldset>
+<fieldset><legend>Layer Height</legend>
+  <label><input type="checkbox" id="adaptive"> Adaptive layer height</label>
+  <div class="slider"><span>Quality / Speed</span>
+    <input type="range" id="quality" min="0" max="1" step="0.01">
+    <output id="quality_out"></output></div>
+  <label><input type="checkbox" id="smooth"> Smooth</label>
+  <div class="slider"><span>Radius</span>
+    <input type="range" id="radius" min="1" max="10" step="1">
+    <output id="radius_out"></output></div>
+  <label class="indent"><input type="checkbox" id="keep_min"> Keep min</label>
+  <div class="note flat">Same as Adaptive and Smooth in the Variable Layer Height tool, for
+    every object that is arranged. Smooth alone smooths each object's current
+    profile.</div>
+</fieldset>
 <fieldset><legend>Save To</legend>
   <label><input type="radio" name="output" value="replace"> Project file</label>
   <div class="note">Replaces the saved project. A backup is kept as
@@ -1270,6 +1687,16 @@ function applyState(st) {
   if (s.plates) pick('plates', s.plates);
   if (s.align_y) document.getElementById('align').value = s.align_y;
   if (s.output) pick('output', s.output);
+  if (s.adaptive !== undefined) document.getElementById('adaptive').checked = !!s.adaptive;
+  if (s.adaptive_quality !== undefined) {
+    document.getElementById('quality').value = s.adaptive_quality;
+  }
+  if (s.smooth !== undefined) document.getElementById('smooth').checked = !!s.smooth;
+  if (s.smooth_radius !== undefined) document.getElementById('radius').value = s.smooth_radius;
+  if (s.smooth_keep_min !== undefined) {
+    document.getElementById('keep_min').checked = !!s.smooth_keep_min;
+  }
+  updateLayerControls();
   if (st.plate !== undefined) {
     document.getElementById('plateinfo').textContent = 'Selected: plate ' + st.plate + '.';
   }
@@ -1281,6 +1708,22 @@ function applyState(st) {
       : '';
   }
 }
+function updateLayerControls() {
+  const q = document.getElementById('quality'), r = document.getElementById('radius');
+  document.getElementById('quality_out').textContent = Number(q.value).toFixed(2);
+  document.getElementById('radius_out').textContent = r.value;
+  const a = document.getElementById('adaptive').checked;
+  const sm = document.getElementById('smooth').checked;
+  q.disabled = !a;
+  q.parentNode.className = 'slider' + (a ? '' : ' off');
+  r.disabled = !sm;
+  r.parentNode.className = 'slider' + (sm ? '' : ' off');
+  document.getElementById('keep_min').disabled = !sm;
+  document.getElementById('keep_min').parentNode.className = 'indent' + (sm ? '' : ' off');
+}
+['adaptive', 'smooth', 'quality', 'radius'].forEach(function (id) {
+  document.getElementById(id).addEventListener('input', updateLayerControls);
+});
 function color(f) {
   const hue = f < 0.5 ? 210 - 200 * f : 110 - 180 * (f - 0.5);
   return 'hsl(' + Math.round(hue) + ',70%,' + Math.round(60 - 15 * f) + '%)';
@@ -1332,7 +1775,12 @@ function settings() {
     layout: value('layout'),
     plates: value('plates'),
     align_y: document.getElementById('align').value,
-    output: value('output')
+    output: value('output'),
+    adaptive: document.getElementById('adaptive').checked,
+    adaptive_quality: Number(document.getElementById('quality').value),
+    smooth: document.getElementById('smooth').checked,
+    smooth_radius: Number(document.getElementById('radius').value),
+    smooth_keep_min: document.getElementById('keep_min').checked
   };
 }
 document.getElementById('out').addEventListener('input', function () { outEdited = true; });
@@ -1359,6 +1807,9 @@ pick('spacing', 'auto');
 pick('layout', 'compact');
 pick('plates', 'current');
 pick('output', 'new');
+document.getElementById('quality').value = 0.5;
+document.getElementById('radius').value = 5;
+updateLayerControls();
 orca.postMessage({type: 'ready'});
 </script></body></html>
 """
@@ -1388,6 +1839,13 @@ def _live_bboxes():
     return boxes
 
 
+def _clamp_number(value, lo, hi, default):
+    try:
+        return min(max(float(value), lo), hi)
+    except (TypeError, ValueError):
+        return default
+
+
 def _clean_settings(raw, saved):
     """Settings from the page, checked. Raises ArrangeError for a bad value."""
     raw = raw or {}
@@ -1406,6 +1864,11 @@ def _clean_settings(raw, saved):
                    else "current"),
         "output": raw.get("output") if raw.get("output") in ("new", "replace") else "new",
         "align_y": raw.get("align_y") if raw.get("align_y") in ("auto", "on", "off") else "auto",
+        "adaptive": bool(raw.get("adaptive")),
+        "adaptive_quality": _clamp_number(raw.get("adaptive_quality"), 0.0, 1.0, 0.5),
+        "smooth": bool(raw.get("smooth")),
+        "smooth_radius": int(_clamp_number(raw.get("smooth_radius"), 1, 10, 5)),
+        "smooth_keep_min": bool(raw.get("smooth_keep_min")),
     }
 
 
@@ -1451,6 +1914,8 @@ def run_live(raw_settings, out_path, saved):
                                    _count(summary["plates"], "plate"))
     if summary["aligned"]:
         text += " Turned %s to the Y axis." % _count(summary["rotated"], "object")
+    if summary["layer_heights"]:
+        text += " Set layer heights for %s." % _count(summary["layer_heights"], "object")
     if backup:
         text += ("\nReplaced %s (backup: %s).\nTo see the result, open the project again "
                  "with File > Recent Projects. If OrcaSlicer asks to save changes, click "
@@ -1556,6 +2021,11 @@ def main(argv=None):
                         help="all: every plate, objects stay on their plate; "
                              "current: only the plate given with --plate")
     parser.add_argument("--plate", type=int, default=1, help="plate number for --plates current")
+    parser.add_argument("--adaptive", type=float, metavar="QUALITY",
+                        help="adaptive layer height, 0 (quality) to 1 (speed)")
+    parser.add_argument("--smooth", type=int, metavar="RADIUS",
+                        help="smooth the layer height profile, radius 1 to 10")
+    parser.add_argument("--keep-min", action="store_true", help="smooth: keep min")
     parser.add_argument("--align-y", choices=("auto", "on", "off"), default="auto",
                         help="turn long objects along Y (auto: on for i3 printers)")
     args = parser.parse_args(argv)
@@ -1567,7 +2037,11 @@ def main(argv=None):
     out = args.output or os.path.splitext(args.input)[0] + "-arranged.3mf"
     settings = {"spacing": args.spacing, "layout": args.layout,
                 "plates": "keep" if args.plates == "all" else args.plates,
-                "plate_index": args.plate - 1, "align_y": args.align_y}
+                "plate_index": args.plate - 1, "align_y": args.align_y,
+                "adaptive": args.adaptive is not None,
+                "adaptive_quality": args.adaptive if args.adaptive is not None else 0.5,
+                "smooth": args.smooth is not None, "smooth_radius": args.smooth or 5,
+                "smooth_keep_min": args.keep_min}
     try:
         summary = arrange_file(args.input, out, settings)
     except ArrangeError as err:
